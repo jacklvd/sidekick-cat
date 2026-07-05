@@ -1,0 +1,9 @@
+# Runtime deps. Used by both the Actions workflows and the Cloud Run container (server/).
+# Local dev uses uv + pyproject.toml; this list is the Docker build target.
+openai>=1.0        # Groq + GitHub Models are both OpenAI-compatible
+PyGithub>=2.0      # Auth.AppAuth -> installation token (no separate JWT dep needed)
+fastapi>=0.110     # Cloud Run webhook service
+uvicorn[standard]>=0.29
+google-cloud-firestore>=2.16  # shared daily caps + dedup across instances (LIMITS_BACKEND=firestore)
+# dev-note: no google-cloud-tasks yet — in-process background hand-off at personal
+#           scale. Add Cloud Tasks if volume warrants retries.

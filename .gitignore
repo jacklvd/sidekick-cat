@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.remember/
+
+# Secrets — never commit credentials or generated env files.
+
+*.pem
+*.key
+
+.env
+.env.*
+# ...but keep the committed template.
+!.env.example
+# Streamlit stores wizard secrets here.
+.streamlit/secrets.toml
+
+# OS / editor cruft
+.DS_Store

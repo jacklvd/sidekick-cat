@@ -1,0 +1,22 @@
+# What `gcloud run deploy --source .` must NOT upload to Cloud Build.
+# Without this file gcloud falls back to the root .gitignore only — nested
+# ignores (infra/terraform/.gitignore) are skipped, so the ~200MB .terraform
+# provider binary would ship with every deploy.
+.gcloudignore
+.git
+.gitignore
+#!include:.gitignore
+
+# Secrets — never upload, even if .gitignore is reorganized. Runtime gets these
+# from Secret Manager; the local .env / PEM are dev-only.
+*.pem
+.env
+*.env
+.env.*
+
+# Not needed to build the service image (Dockerfile copies server/scripts/templates).
+infra/
+tools/
+.github/
+.remember/
+.claude/

@@ -1,0 +1,8 @@
+# Never commit state or provider binaries. tfstate can hold resource metadata
+# (and would hold secret values if any version were ever managed — we don't).
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform.lock.hcl
+crash.log

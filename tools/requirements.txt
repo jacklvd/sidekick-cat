@@ -1,0 +1,6 @@
+# Local dev installs streamlit via `uv run --extra setup-wizard` (pyproject.toml).
+# This file exists only for Streamlit Community Cloud: it searches for a
+# dependency file starting in the entrypoint's own directory before falling
+# back to the repo root, where it would otherwise find uv.lock (which doesn't
+# include this extra) ahead of any requirements.txt.
+streamlit>=1.38

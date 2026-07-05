@@ -1,0 +1,33 @@
+name: smoke-bot
+
+# Prove the branded GitHub App identity. Mints an App installation token and
+# posts a comment so it shows up under the App's name (sidekick-cat[bot]), not
+# github-actions[bot].
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to post the hello comment on"
+        required: true
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Mint app token
+        id: app_token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          client-id: ${{ secrets.APP_CLIENT }}
+          private-key: ${{ secrets.APP_KEY }}
+      - name: Post hello as the bot
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: >
+          gh pr comment "${{ inputs.pr }}"
+          --repo "${{ github.repository }}"
+          --body "👋 Hello from the sidekick-cat bot — branded identity works."

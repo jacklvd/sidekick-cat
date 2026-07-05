@@ -1,0 +1,21 @@
+name: smoke-models
+
+# Prove free GitHub Models inference works. Manual trigger only.
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      models: read          # lets the built-in GITHUB_TOKEN call GitHub Models
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.13"
+      - name: Call the model and print the reply
+        env:
+          MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: uv run python -m scripts.models_client
