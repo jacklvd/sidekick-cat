@@ -165,13 +165,19 @@ with `uv run --env-file .env ...`.
 
 ## Guided setup
 
-First time setting this up? `tools/setup_wizard.py` is a local Streamlit page
-that walks through the GCP project/APIs, the exact GitHub App permissions this
-bot needs (traced from the actual API calls, not guessed), a webhook-secret
+First time setting this up? `tools/setup_wizard.py` is a Streamlit page that
+walks through the GCP project/APIs, the exact GitHub App permissions this bot
+needs (traced from the actual API calls, not guessed), a webhook-secret
 generator, and the GitHub Models / Groq tokens — ending in a ready-to-copy
-`.env` and first-deploy command. Nothing you type leaves your machine. A final
-**Teardown** tab covers pausing or fully deleting everything the bot spun up,
-with the delete commands pre-filled from your project id.
+`.env` and first-deploy command. A final **Teardown** tab covers pausing or
+fully deleting everything the bot spun up, with the delete commands pre-filled
+from your project id.
+
+**[▶ Try the live wizard](https://sidekick-cat-guide.streamlit.app/)** to read
+through the steps, permissions, and commands. When you're ready to enter *real*
+secrets (webhook secret, tokens), run it **locally** instead — a hosted
+Streamlit app runs server-side, so your input reaches Streamlit's servers,
+whereas the local run keeps everything on your machine:
 
 ```bash
 uv run --extra setup-wizard streamlit run tools/setup_wizard.py
