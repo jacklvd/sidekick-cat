@@ -30,7 +30,7 @@ GITHUB_APP_PERMISSIONS = [
 
 GITHUB_APP_WEBHOOK_EVENTS = ["Pull request", "Issue comment"]
 
-_ENV_KEYS = ["APP_ID", "APP_KEY", "WEBHOOK_SECRET", "GROQ_API_KEY", "MODELS_PAT"]
+_ENV_KEYS = ["APP_ID", "APP_KEY", "WEBHOOK_SECRET", "NVIDIA_API_KEY", "GROQ_API_KEY", "MODELS_PAT"]
 
 
 def render_enable_apis_cmd(project: str) -> str:
@@ -67,6 +67,7 @@ def render_deploy_cmd(project: str, region: str, app_id: str, with_firestore: bo
         env_vars += ",LIMITS_BACKEND=firestore"
     secrets_flag = (
         "APP_KEY=APP_KEY:latest,WEBHOOK_SECRET=WEBHOOK_SECRET:latest,"
+        "NVIDIA_API_KEY=NVIDIA_API_KEY:latest,"
         "GROQ_API_KEY=GROQ_API_KEY:latest,MODELS_PAT=MODELS_PAT:latest"
     )
     return (
@@ -87,7 +88,7 @@ def render_teardown_guide(project: str = "", region: str = "") -> str:
 ## Take Sidekick offline
 
 Either **pause** it (reversible, seconds) or **fully delete** every service it
-spun up. The bot spans GitHub, Google Cloud, and two external LLM providers.
+spun up. The bot spans GitHub, Google Cloud, and three external LLM providers.
 
 **No surprise bills either way.** The LLM providers are free-tier (no card → they
 can only `429`). The only thing that can cost money is Cloud Run, and it scales to
@@ -101,12 +102,12 @@ is about tidiness and revoking credentials, not stopping a bill.
 | GitHub App | **sidekick-cat** — webhook active, installed on all repos |
 | Cloud Run service | `sidekick-cat` · project `{proj}` · region `{reg}` |
 | Firestore | native DB `(default)` · `{reg}` · collections `llm_counts`, `deliveries`, `reviewed_shas` |
-| Secret Manager | `APP_KEY`, `WEBHOOK_SECRET`, `GROQ_API_KEY`, `MODELS_PAT` |
+| Secret Manager | `APP_KEY`, `WEBHOOK_SECRET`, `NVIDIA_API_KEY`, `GROQ_API_KEY`, `MODELS_PAT` |
 | Artifact Registry | `cloud-run-source-deploy` |
 | Cloud Storage | `run-sources-{proj}-{reg}` (source tarballs from `--source` deploys) |
 | Runtime service account | `<PROJECT_NUMBER>-compute@developer.gserviceaccount.com` (roles: `secretmanager.secretAccessor`, `datastore.user`) |
 | Billing budget | ~$5/mo with alerts |
-| External accounts | Groq (`GROQ_API_KEY`), GitHub fine-grained PAT (`MODELS_PAT`, `models` scope) |
+| External accounts | NVIDIA build.nvidia.com (`NVIDIA_API_KEY`), Groq (`GROQ_API_KEY`), GitHub fine-grained PAT (`MODELS_PAT`, `models` scope) |
 
 ### Option A — Pause (reversible, recommended first)
 
@@ -141,7 +142,7 @@ gcloud firestore databases delete --database='(default)' --quiet
 #    If unavailable, delete collections llm_counts/deliveries/reviewed_shas from the console.
 
 # 4. Secret Manager
-for s in APP_KEY WEBHOOK_SECRET GROQ_API_KEY MODELS_PAT; do gcloud secrets delete "$s" --quiet; done
+for s in APP_KEY WEBHOOK_SECRET NVIDIA_API_KEY GROQ_API_KEY MODELS_PAT; do gcloud secrets delete "$s" --quiet; done
 
 # 5. Artifact Registry + source bucket
 gcloud artifacts repositories delete cloud-run-source-deploy --location={reg} --quiet
@@ -163,8 +164,9 @@ gcloud projects delete {proj}
 
 **7. Billing budget:** Cloud Billing → Budgets & alerts → delete the ~$5/mo budget (console only).
 
-**9. Revoke external credentials:** Groq console → revoke the `GROQ_API_KEY`; GitHub →
-Fine-grained tokens → revoke the `models`-scoped `MODELS_PAT`.
+**9. Revoke external credentials:** build.nvidia.com → API keys → revoke the
+`nvapi-...` key behind `NVIDIA_API_KEY`; Groq console → revoke the `GROQ_API_KEY`;
+GitHub → Fine-grained tokens → revoke the `models`-scoped `MODELS_PAT`.
 
 ### Verify it's gone
 

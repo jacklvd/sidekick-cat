@@ -5,19 +5,20 @@
 Most review bots either cost money per seat or post as the anonymous
 `github-actions[bot]`. sidekick-cat is neither: it's a real, branded GitHub App
 that reviews every PR, answers to slash commands, and never sends you an invoice
-— because both LLM providers behind it are free-tier by design.
+— because every LLM provider behind it is free-tier by design.
 
 ![Python 3.13](https://img.shields.io/badge/python-3.13-blue)
 ![managed with uv](https://img.shields.io/badge/managed%20with-uv-de5fe9)
 ![Cloud Run](https://img.shields.io/badge/runs%20on-Cloud%20Run-4285F4)
-![LLM: Groq → GitHub Models](https://img.shields.io/badge/LLM-Groq%20%E2%86%92%20GitHub%20Models-f55036)
+![LLM: NVIDIA → Groq → GitHub Models](https://img.shields.io/badge/LLM-NVIDIA%20%E2%86%92%20Groq%20%E2%86%92%20GitHub%20Models-f55036)
 ![cost](https://img.shields.io/badge/cost-~%240%2Fmo-brightgreen)
 ![MIT license](https://img.shields.io/badge/license-MIT-green)
 
 ## Why you'd want this
 
-- 🆓 **Actually free** — Groq and GitHub Models are both no-card free tiers, so
-  inference can only ever 429, never bill. Cloud Run scales to zero between events.
+- 🆓 **Actually free** — NVIDIA NIM, Groq, and GitHub Models are all no-card free
+  tiers, so inference can only ever 429, never bill. Cloud Run scales to zero
+  between events.
 - 🏷️ **A bot with a face, not `github-actions[bot]`** — its own GitHub App, its
   own avatar, its own voice in every comment.
 - 🌐 **Zero per-repo setup** — install once on your whole account; every repo gets
@@ -105,12 +106,12 @@ flowchart TB
     RV --> LLM
     CX --> LLM
 
-    LLM["llm_client<br/>🆓 Groq → GitHub Models"]
+    LLM["llm_client<br/>🆓 NVIDIA → Groq → GitHub Models"]
     LIM["limits<br/>Firestore: daily caps + breaker"]
 
-    DI -.->|secrets| SM["🔐 Secret Manager<br/>APP_KEY · WEBHOOK_SECRET<br/>GROQ_API_KEY · MODELS_PAT"]
+    DI -.->|secrets| SM["🔐 Secret Manager<br/>APP_KEY · WEBHOOK_SECRET<br/>NVIDIA_API_KEY · GROQ_API_KEY · MODELS_PAT"]
     LIM --> FS["(Firestore · us-west1)"]
-    LLM -->|inference, $0| EXT["Groq / GitHub Models"]
+    LLM -->|inference, $0| EXT["NVIDIA / Groq / GitHub Models"]
 
     FLOWS -->|"comments · labels · review · merge"| GH
 ```
@@ -138,7 +139,7 @@ tools/          setup_wizard.py — guided GCP/GitHub App/token setup + a Teardo
 
 ### Cost safeguards
 
-The LLM side is **structurally free** — both providers are on no-card free tiers, so
+The LLM side is **structurally free** — all three providers are on no-card free tiers, so
 they can only ever return `429`, never bill. The guards bound Cloud Run instead:
 loop guard (drop bot-authored events), Firestore daily caps (global / per-repo /
 per-PR) + a circuit breaker, `--max-instances=3`, `--min-instances=0`, and a $5/mo
@@ -168,7 +169,7 @@ with `uv run --env-file .env ...`.
 First time setting this up? `tools/setup_wizard.py` is a Streamlit page that
 walks through the GCP project/APIs, the exact GitHub App permissions this bot
 needs (traced from the actual API calls, not guessed), a webhook-secret
-generator, and the GitHub Models / Groq tokens — ending in a ready-to-copy
+generator, and the NVIDIA / Groq / GitHub Models tokens — ending in a ready-to-copy
 `.env` and first-deploy command. A final **Teardown** tab covers pausing or
 fully deleting everything the bot spun up, with the delete commands pre-filled
 from your project id.
@@ -194,7 +195,7 @@ gcloud run deploy sidekick-cat --source . --region us-west1 \
   --allow-unauthenticated --min-instances=0 --max-instances=3 --timeout=300 \
   --no-cpu-throttling \
   --set-env-vars APP_ID=<app_id>,LIMITS_BACKEND=firestore \
-  --set-secrets APP_KEY=APP_KEY:latest,WEBHOOK_SECRET=WEBHOOK_SECRET:latest,GROQ_API_KEY=GROQ_API_KEY:latest,MODELS_PAT=MODELS_PAT:latest
+  --set-secrets APP_KEY=APP_KEY:latest,WEBHOOK_SECRET=WEBHOOK_SECRET:latest,NVIDIA_API_KEY=NVIDIA_API_KEY:latest,GROQ_API_KEY=GROQ_API_KEY:latest,MODELS_PAT=MODELS_PAT:latest
 ```
 
 Then set the GitHub App webhook URL to the service URL + `/webhook`, subscribe to
@@ -208,8 +209,9 @@ Then set the GitHub App webhook URL to the service URL + `/webhook`, subscribe t
 | `LIMITS_BACKEND` | env var | `firestore` to share caps/dedup across instances; unset → in-memory |
 | `APP_KEY` | Secret Manager | App private key (PEM) → mints installation tokens |
 | `WEBHOOK_SECRET` | Secret Manager | verifies `X-Hub-Signature-256` |
-| `GROQ_API_KEY` | Secret Manager | primary inference (Groq) |
-| `MODELS_PAT` | Secret Manager | fallback inference (GitHub Models; needs the `models` scope) |
+| `NVIDIA_API_KEY` | Secret Manager | primary inference for `/review` and `/context` (NVIDIA NIM: GLM-5.2 → MiniMax-M2.7). `nvapi-...` key from build.nvidia.com |
+| `GROQ_API_KEY` | Secret Manager | summaries + first fallback (Groq) |
+| `MODELS_PAT` | Secret Manager | last fallback (GitHub Models; needs the `models` scope) |
 
 See [`.env.example`](.env.example) for the full list, including the legacy
 GitHub Actions workflow vars.

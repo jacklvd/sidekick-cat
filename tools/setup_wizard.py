@@ -38,13 +38,14 @@ st.caption(
 )
 
 # --- Sidebar progress tracker. Reads widget values persisted in session_state
-# from prior reruns, so the checklist reflects what you've filled in so far. The
-# first four are required for a working .env + deploy; the Models token is the
-# optional fallback provider. ---
+# from prior reruns, so the checklist reflects what you've filled in so far.
+# These are required for a working .env + deploy; the Models token is the
+# optional last-resort fallback provider. ---
 _REQUIRED = [
     ("GCP project id", "project"),
     ("GitHub App ID", "app_id"),
     ("Webhook secret", "webhook_secret"),
+    ("NVIDIA key", "nvidia_api_key"),
     ("Groq key", "groq_api_key"),
 ]
 with st.sidebar:
@@ -60,9 +61,9 @@ with st.sidebar:
     st.divider()
     st.caption("Head to the **Summary** tab once the required steps are green.")
 
-tab_overview, tab_gcp, tab_app, tab_models, tab_groq, tab_summary, tab_teardown = st.tabs(
-    ["1. Overview", "2. GCP", "3. GitHub App", "4. Models token", "5. Groq key",
-     "6. Summary", "7. Teardown"]
+tab_overview, tab_gcp, tab_app, tab_nvidia, tab_groq, tab_models, tab_summary, tab_teardown = st.tabs(
+    ["1. Overview", "2. GCP", "3. GitHub App", "4. NVIDIA key", "5. Groq key",
+     "6. Models token", "7. Summary", "8. Teardown"]
 )
 
 with tab_overview:
@@ -71,11 +72,13 @@ with tab_overview:
         "- A **Google Cloud project** with billing enabled (Cloud Run scales to "
         "zero, so an idle bot costs ~$0)\n"
         "- A **GitHub account** with permission to create a GitHub App on it\n"
-        "- A free **[Groq](https://console.groq.com)** account for primary inference\n"
+        "- A free **[NVIDIA build.nvidia.com](https://build.nvidia.com)** account "
+        "for primary review/context inference\n"
+        "- A free **[Groq](https://console.groq.com)** account for summaries and fallback\n"
     )
     st.subheader("How this works")
     st.markdown(
-        "Work through tabs **2 → 5** — each hands you the exact command, link, or "
+        "Work through tabs **2 → 6** — each hands you the exact command, link, or "
         "value for that step. The **Summary** tab then assembles a ready-to-copy "
         "`.env` and your first-deploy `gcloud` command. The sidebar tracks what's "
         "left. Done with the bot later? The **Teardown** tab pauses or removes it."
@@ -149,6 +152,20 @@ with tab_app:
         st.code(st.session_state["webhook_secret"], language="text")
         st.caption("Stored for the Summary tab. Generate again to replace it.")
 
+with tab_nvidia:
+    st.subheader("NVIDIA key (primary inference for /review and /context)")
+    st.link_button("Open build.nvidia.com ↗", "https://build.nvidia.com")
+    st.markdown(
+        "Sign up (no card) → any model page → **Get API Key**. The key starts "
+        "with `nvapi-`. NVIDIA NIM's free tier is rate-limited per request (not "
+        "per token), and its models are large-context — so it leads the review "
+        "tiers; Groq and GitHub Models stay as fallbacks."
+    )
+    nvidia_api_key = st.text_input(
+        "Paste the key (optional, for the summary below)",
+        key="nvidia_api_key", type="password",
+    )
+
 with tab_models:
     st.subheader("GitHub Models token (fallback inference)")
     st.link_button(
@@ -165,7 +182,7 @@ with tab_models:
     )
 
 with tab_groq:
-    st.subheader("Groq key (primary inference)")
+    st.subheader("Groq key (summaries + first fallback)")
     st.link_button("Open Groq → API Keys ↗", "https://console.groq.com/keys")
     st.markdown(
         "Sign up (no card) → **API Keys** → create one. It's a single key, no "
@@ -190,6 +207,7 @@ with tab_summary:
         {
             "APP_ID": st.session_state.get("app_id", ""),
             "WEBHOOK_SECRET": st.session_state.get("webhook_secret", ""),
+            "NVIDIA_API_KEY": st.session_state.get("nvidia_api_key", ""),
             "GROQ_API_KEY": st.session_state.get("groq_api_key", ""),
             "MODELS_PAT": st.session_state.get("models_pat", ""),
             "with_firestore": st.session_state.get("with_firestore", False),

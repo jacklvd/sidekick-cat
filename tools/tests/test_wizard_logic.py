@@ -38,6 +38,7 @@ def test_webhook_secret_is_random():
 def test_env_block():
     env = render_env_block({"APP_ID": "123", "GROQ_API_KEY": "g", "with_firestore": True})
     assert "APP_ID=123" in env and "APP_KEY=\n" in env and "LIMITS_BACKEND=firestore" in env
+    assert "NVIDIA_API_KEY=" in env  # primary inference key always listed
     assert "LIMITS_BACKEND" not in render_env_block({})  # no firestore -> no line at all
 
 
@@ -46,6 +47,7 @@ def test_deploy_cmd():
     assert "--project my-proj" in cmd and "--region us-west1" in cmd
     assert "APP_ID=42,LIMITS_BACKEND=firestore" in cmd
     assert "--set-secrets APP_KEY=APP_KEY:latest" in cmd
+    assert "NVIDIA_API_KEY=NVIDIA_API_KEY:latest" in cmd
     no_fs_cmd = render_deploy_cmd("my-proj", "us-west1", "", with_firestore=False)
     assert "APP_ID=<app_id> \\" in no_fs_cmd and "LIMITS_BACKEND" not in no_fs_cmd
 
@@ -57,6 +59,7 @@ def test_teardown_guide():
     assert "gs://run-sources-my-proj-us-east1" in guide
     assert "gcloud projects delete my-proj" in guide
     assert "<your-gcp-project>" not in guide
+    assert "NVIDIA_API_KEY" in guide  # secret delete list + revoke step cover it
     # empty inputs fall back to safe placeholders (guide still renders)
     empty = render_teardown_guide()
     assert "<your-gcp-project>" in empty and "--region us-west1" in empty

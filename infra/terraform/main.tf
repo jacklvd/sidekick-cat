@@ -92,6 +92,16 @@ resource "google_secret_manager_secret" "webhook_secret" {
   }
 }
 
+resource "google_secret_manager_secret" "nvidia_api_key" {
+  secret_id = "NVIDIA_API_KEY"
+  replication {
+    auto {}
+  }
+  lifecycle {
+    ignore_changes = all
+  }
+}
+
 resource "google_secret_manager_secret" "groq_api_key" {
   secret_id = "GROQ_API_KEY"
   replication {

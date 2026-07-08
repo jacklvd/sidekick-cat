@@ -28,6 +28,11 @@ import {
 }
 
 import {
+  to = google_secret_manager_secret.nvidia_api_key
+  id = "projects/your-gcp-project-id/secrets/NVIDIA_API_KEY"
+}
+
+import {
   to = google_secret_manager_secret.groq_api_key
   id = "projects/your-gcp-project-id/secrets/GROQ_API_KEY"
 }
