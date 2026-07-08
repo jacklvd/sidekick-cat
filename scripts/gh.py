@@ -168,12 +168,14 @@ def set_managed_labels(repo, pr_number, desired, managed):
         issue.remove_from_labels(name)
 
 
-def get_tree(repo) -> list[str]:
-    """All blob (file) paths in the repo's default branch, recursive. Best-effort
-    — an empty/unreadable repo yields an empty list rather than raising."""
+def get_tree(repo) -> list[tuple[str, int]]:
+    """All blob (file) (path, size-in-bytes) pairs in the repo's default branch,
+    recursive. Sizes ride along free in the same API response — repo_context uses
+    them to mark heavyweight files and pick which heads to fetch. Best-effort —
+    an empty/unreadable repo yields an empty list rather than raising."""
     try:
         tree = repo.get_git_tree(repo.default_branch, recursive=True)
-        return [e.path for e in tree.tree if e.type == "blob"]
+        return [(e.path, e.size or 0) for e in tree.tree if e.type == "blob"]
     except Exception:
         return []
 

@@ -108,7 +108,8 @@ def test_review_gating():
 
 def test_review_routes_by_size():
     # Small diff -> "review" tier, no disclaimer. Diff over MAX_DIFF_CHARS -> the
-    # high-TPM "review_large" tier with the Llama-4 Scout note prepended.
+    # high-TPM "review_large" tier with a big-PR note that NAMES the model that
+    # actually answered (dynamic — not a hardcoded fallback like Scout).
     import scripts.review_pr as rp
     from scripts import limits
     from scripts.config import MAX_DIFF_CHARS
@@ -121,9 +122,15 @@ def test_review_routes_by_size():
         def get_pull(self, n):
             return type("P", (), {"head": type("H", (), {"sha": "h"}), "title": "t", "body": ""})()
 
+    def fake_complete(s, u, t, **kw):
+        tasks.append(t)
+        if kw.get("used") is not None:  # simulate MiniMax answering (not the primary)
+            kw["used"].append(("nvidia", "minimaxai/minimax-m2.7"))
+        return '{"verdict":"comment","summary":"ok","issues":[]}'
+
     orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
             rp.repo_context.ensure_fresh)
-    rp.complete = lambda s, u, t, **kw: (tasks.append(t), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
+    rp.complete = fake_complete
     rp.gh.upsert_comment = lambda repo, n, marker, body: bodies.append(body)
     rp.gh.get_file_text = lambda repo, path: ""
     rp.reconcile_inline = lambda *a, **k: None
@@ -134,7 +141,8 @@ def test_review_routes_by_size():
         limits._reset()
         rp.run(FakeRepo(), 2, "y" * (MAX_DIFF_CHARS + 1))   # huge -> large tier
         assert tasks == ["review", "review_large"]
-        assert "Scout" not in bodies[0] and "Scout" in bodies[1]  # note only when large
+        # note only when large, and it names the responder (MiniMax), not a default
+        assert "MiniMax-M2.7" not in bodies[0] and "MiniMax-M2.7" in bodies[1]
     finally:
         (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
          rp.repo_context.ensure_fresh) = orig
@@ -143,13 +151,26 @@ def test_review_routes_by_size():
 def test_render_tree():
     from scripts.repo_context import render_tree
 
-    paths = ["app.py", "scripts/gh.py", "uv.lock", "static/app.min.js"]
-    out = render_tree(paths, globs=["*.lock", "*.min.js"], max_chars=1000)
-    assert "app.py" in out and "scripts/gh.py" in out
+    entries = [("app.py", 120), ("scripts/gh.py", 4096), ("uv.lock", 90000), ("static/app.min.js", 5)]
+    out = render_tree(entries, globs=["*.lock", "*.min.js"], max_chars=1000)
+    assert "app.py (120B)" in out and "scripts/gh.py (4K)" in out  # sizes shown
     assert "uv.lock" not in out and "app.min.js" not in out  # noise filtered
     # tight cap -> some entries omitted, with a note
-    tight = render_tree(["a.py", "b.py", "c.py"], globs=[], max_chars=6)
+    tight = render_tree([("a.py", 1), ("b.py", 1), ("c.py", 1)], globs=[], max_chars=6)
     assert "omitted" in tight
+
+
+def test_pick_head_files():
+    from scripts.repo_context import pick_head_files
+
+    entries = [
+        ("big.py", 9000), ("small.py", 10), ("mid.py", 500),
+        ("dist/bundle.js", 99999),      # noise-filtered despite its size
+        ("README.md", 8000),            # not a source file
+    ]
+    # largest source files first, noise and non-code excluded
+    assert pick_head_files(entries, n=2) == ["big.py", "mid.py"]
+    assert pick_head_files(entries, n=10) == ["big.py", "mid.py", "small.py"]
 
 
 def test_build_context_prompt():
@@ -185,7 +206,7 @@ def test_repo_context_run_and_ensure_fresh():
 
     orig = (rc.gh.get_tree, rc.gh.get_file_text, rc.gh.upsert_issue,
             rc.gh.get_context_issue, rc.complete)
-    rc.gh.get_tree = lambda repo: ["a.py"]
+    rc.gh.get_tree = lambda repo: [("a.py", 10)]
     rc.gh.get_file_text = lambda repo, name: "readme" if name == "README.md" else None
     rc.gh.upsert_issue = lambda repo, marker, title, body: upserted.append(body)
     rc.gh.get_context_issue = lambda repo, marker: None
@@ -355,7 +376,8 @@ def test_run_feeds_pr_text_to_model():
 
     orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
             rp.repo_context.ensure_fresh)
-    rp.complete = lambda s, u, t, **kw: (prompts.append(u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
+    # `u` is a per-model prompt builder now — resolve it the way complete() would.
+    rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, marker, body: None
     rp.gh.get_file_text = lambda repo, path: ""
     rp.reconcile_inline = lambda *a, **k: None
@@ -385,7 +407,8 @@ def test_run_feeds_project_context_to_model():
 
     orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
             rp.repo_context.ensure_fresh)
-    rp.complete = lambda s, u, t, **kw: (prompts.append(u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
+    # `u` is a per-model prompt builder now — resolve it the way complete() would.
+    rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, marker, body: None
     rp.gh.get_file_text = lambda repo, path: ""
     rp.reconcile_inline = lambda *a, **k: None
@@ -436,11 +459,12 @@ def test_get_tree():
     from scripts import gh
 
     class Elem:
-        def __init__(self, path, type_):
-            self.path, self.type = path, type_
+        def __init__(self, path, type_, size=None):
+            self.path, self.type, self.size = path, type_, size
 
     class Tree:
-        tree = [Elem("app.py", "blob"), Elem("scripts", "tree"), Elem("uv.lock", "blob")]
+        # dirs have no size (None) — get_tree must coerce, not crash
+        tree = [Elem("app.py", "blob", 120), Elem("scripts", "tree"), Elem("uv.lock", "blob", 9000)]
 
     class FakeRepo:
         default_branch = "main"
@@ -449,7 +473,7 @@ def test_get_tree():
             assert sha == "main" and recursive is True
             return Tree()
 
-    assert gh.get_tree(FakeRepo()) == ["app.py", "uv.lock"]  # only blobs, dirs excluded
+    assert gh.get_tree(FakeRepo()) == [("app.py", 120), ("uv.lock", 9000)]  # only blobs, dirs excluded
 
     class BoomRepo:
         default_branch = "main"
@@ -580,7 +604,8 @@ def test_review_incremental():
     full = _block("full.py", "+base\n") + _block("changed.py", "+base\n")
     orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text,
             rp.reconcile_inline, rp.gh.compare_diff, rp.repo_context.ensure_fresh)
-    rp.complete = lambda s, u, t, **kw: (prompts.append(u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
+    # `u` is a per-model prompt builder now — resolve it the way complete() would.
+    rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, m, body: bodies.append(body)
     rp.gh.get_file_text = lambda repo, path: ""
     rp.reconcile_inline = lambda repo, n, s, anch, scope=None: scopes.append(scope)
@@ -760,6 +785,7 @@ if __name__ == "__main__":
     test_review_gating()
     test_review_routes_by_size()
     test_render_tree()
+    test_pick_head_files()
     test_build_context_prompt()
     test_is_stale()
     test_repo_context_run_and_ensure_fresh()

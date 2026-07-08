@@ -14,21 +14,38 @@ REVIEW_MODEL = "openai/gpt-4.1"
 # provider-then-model nesting couldn't express.
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GH_MODELS_BASE = MODELS_BASE_URL
+# NVIDIA NIM — OpenAI-compatible free endpoint (build.nvidia.com). Auth: NVIDIA_API_KEY
+# (an `nvapi-...` key). RPM-limited (not Groq's tokens-per-minute ceiling), large-context,
+# so it leads the review tiers for quality. Both models honor json_object mode cleanly and
+# keep any reasoning out of message.content (verified live) — required, since /review calls
+# with json_mode=True. dev-note: Kimi-K2.6 was rejected — it returns garbage in json mode on
+# NIM (200, not 400, so _call's retry-plain never fires); smoke any new NVIDIA model in json
+# mode before adding it here, not just plain.
+NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
+NVIDIA_GLM = "z-ai/glm-5.2"  # flagship coding/agentic; review primary, both size tiers
+NVIDIA_MINIMAX = "minimaxai/minimax-m2.7"  # reasoning model; review fallback
+
 # task -> ordered list of (provider, model). Tried first-to-last; first success wins.
-# Review is size-routed (see review_pr.run):
-#   "review"       — small PRs: smartest first (qwen → gpt-4.1 → gpt-oss).
-#   "review_large" — big PRs: highest-TPM first so the whole diff fits ONE pass
-#                    (Llama-4 Scout 30K TPM → groq/compound 70K → gpt-4.1). The
-#                    smart models above cap at 6-8K TPM and would truncate a big diff.
+# Review is size-routed (see review_pr.run), NVIDIA-first for quality then Groq/GitHub fallback:
+#   "review"       — small PRs: GLM-5.2 → MiniMax-M2.7 → qwen → gpt-4.1 → gpt-oss.
+#   "review_large" — big PRs: GLM-5.2 (large ctx) → MiniMax-M2.7 → Scout 30K TPM → compound → gpt-4.1.
+#                    The Groq "smart" models cap at 6-8K TPM and would truncate a big diff.
+# "context" also leads with GLM-5.2: the repo-context brief is folded into every review prompt,
+# so a sharper brief pays off downstream. "summary" stays on Groq — a throwaway per-PR one-liner
+# not worth NVIDIA's RPM budget.
 MODELS = {
     "summary": [("groq", "llama-3.1-8b-instant"), ("github", SUMMARY_MODEL)],
-    "context": [("groq", "llama-3.1-8b-instant"), ("github", SUMMARY_MODEL)],
+    "context": [("nvidia", NVIDIA_GLM), ("groq", "llama-3.1-8b-instant"), ("github", SUMMARY_MODEL)],
     "review": [
+        ("nvidia", NVIDIA_GLM),
+        ("nvidia", NVIDIA_MINIMAX),
         ("groq", "qwen/qwen3-32b"),
         ("github", REVIEW_MODEL),
         ("groq", "openai/gpt-oss-120b"),
     ],
     "review_large": [
+        ("nvidia", NVIDIA_GLM),
+        ("nvidia", NVIDIA_MINIMAX),
         ("groq", "meta-llama/llama-4-scout-17b-16e-instruct"),
         ("groq", "groq/compound"),
         ("github", REVIEW_MODEL),
@@ -62,6 +79,20 @@ NOISE_GLOBS = [
 # truncating. ~4 chars/token → ~14k tokens, comfortably under 30K TPM.
 REVIEW_LARGE_DIFF_CHARS = 56000
 
+# Per-model bulk-payload budget: chars of diff (review) or file tree (context) one
+# request may carry. The NVIDIA NIM models are large-context and RPM-limited (not
+# token-billed), so they take far more than the Groq-TPM / GitHub-request-cap
+# defaults; models not listed keep the caller's tier cap (MAX_DIFF_CHARS /
+# REVIEW_LARGE_DIFF_CHARS / CONTEXT_MAX_TREE_CHARS). Callers pass complete() a
+# prompt *builder* so each fallback attempt is sized for the model actually tried.
+# dev-note: 200K chars ≈ 50K tokens — deliberately conservative for 128K-ctx
+# models; raise after a live /review smoke on a monster PR.
+NVIDIA_INPUT_CHARS = 200_000
+MODEL_INPUT_CHARS = {
+    NVIDIA_GLM: NVIDIA_INPUT_CHARS,
+    NVIDIA_MINIMAX: NVIDIA_INPUT_CHARS,
+}
+
 # Deterministic PR-open.
 # Sections the PR description must contain (matched as line-leading headings,
 # case-insensitive). "TL;DR" (no trailing colon) so both "## TL;DR" and
@@ -93,6 +124,12 @@ CONTEXT_KEY_FILES = [
     "README.md", "CLAUDE.md", "pyproject.toml", "package.json",
     "go.mod", "Cargo.toml", "requirements.txt",
 ]
+# Heads (module docstring + imports) of the N largest source files, folded into
+# the context prompt for large-budget models only (see repo_context) — paths
+# alone can't show what calls what. Costs N extra contents-API calls per refresh,
+# i.e. ~once per CONTEXT_REFRESH_DAYS — negligible.
+CONTEXT_HEAD_FILES = 12
+CONTEXT_HEAD_LINES = 40
 
 # --- cost safeguards. In-memory per instance, or shared via Firestore when
 # LIMITS_BACKEND=firestore. Defaults sit well under Groq's ~1000/day free cap,

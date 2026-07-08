@@ -1,11 +1,14 @@
-"""Provider-abstracted LLM client: Groq (primary) + GitHub Models (fallback).
+"""Provider-abstracted LLM client: NVIDIA NIM (primary) → Groq → GitHub Models.
 
-Both backends are OpenAI-compatible, so one OpenAI() client serves both — only
+All backends are OpenAI-compatible, so one OpenAI() client serves them — only
 the base URL, API key, and model id differ per provider. `complete(system, user,
-task)` tries the primary provider, falls back on rate-limit/transient/auth errors,
-and returns a friendly message if both fail — so callers never crash on quota.
+task)` tries the task's tier in order, falls back on rate-limit/transient/auth
+errors, and returns a friendly message if all fail — so callers never crash on
+quota. `user` may be a callable of the model id, so large-context models get a
+bigger prompt than the fallbacks (see config.MODEL_INPUT_CHARS).
 
-Env: GROQ_API_KEY (Groq), MODELS_PAT (GitHub Models; needs the `models` scope).
+Env: NVIDIA_API_KEY (NVIDIA NIM), GROQ_API_KEY (Groq), MODELS_PAT (GitHub Models;
+needs the `models` scope). A missing key just skips that provider (KeyError → dead).
 Replaces models_client.py (which spoke only to GitHub Models via the built-in token).
 
 Smoke test:  python -m scripts.llm_client
@@ -16,7 +19,7 @@ import os
 from openai import APIConnectionError, APIStatusError, OpenAI
 
 from scripts import limits
-from scripts.config import GH_MODELS_BASE, GROQ_BASE, MAX_DIFF_CHARS, MODELS
+from scripts.config import GH_MODELS_BASE, GROQ_BASE, MAX_DIFF_CHARS, MODELS, NVIDIA_BASE
 from scripts.diff_anchors import block_path, file_blocks
 
 _QUOTA_MSG = "⚠️ AI quota reached, try again later."
@@ -28,6 +31,7 @@ _TOO_LARGE_MSG = (
 
 # provider -> (base_url, env var holding its API key)
 _PROVIDERS = {
+    "nvidia": (NVIDIA_BASE, "NVIDIA_API_KEY"),
     "groq": (GROQ_BASE, "GROQ_API_KEY"),
     "github": (GH_MODELS_BASE, "MODELS_PAT"),
 }
@@ -60,10 +64,14 @@ def _call(provider: str, system: str, user: str, model: str, json_mode: bool = F
     return (resp.choices[0].message.content or "").strip()
 
 
-def complete(system: str, user: str, task: str, json_mode: bool = False) -> str:
+def complete(system: str, user, task: str, json_mode: bool = False, used: list | None = None) -> str:
     """Try primary then fallback. `task` is a key into config.MODELS ('summary'|'review').
 
+    `user` is the prompt (str), or a callable `(model_id) -> str` invoked per attempt
+    so each model gets a prompt sized to its own input budget.
     Returns a friendly message (never raises) so a quota/outage degrades gracefully.
+    If `used` is given, the (provider, model) that actually answered is appended to
+    it — lets a caller name the responder (e.g. the big-PR note) instead of guessing.
     """
     if limits.breaker_open():
         return _QUOTA_MSG  # a provider/API is failing → don't hammer it
@@ -73,8 +81,11 @@ def complete(system: str, user: str, task: str, json_mode: bool = False) -> str:
         if provider in dead:
             continue  # host unreachable or key absent — don't retry its later models
         try:
-            text = _call(provider, system, user, model, json_mode)
+            prompt = user(model) if callable(user) else user
+            text = _call(provider, system, prompt, model, json_mode)
             limits.record_success()
+            if used is not None:
+                used.append((provider, model))
             return text or _EMPTY_MSG
         except APIStatusError as e:
             # RateLimitError (429) is a subclass and lands here too. 413 = diff too

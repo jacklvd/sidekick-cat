@@ -7,8 +7,8 @@ fall back into the summary comment so nothing is lost. The summary stays the
 upserted `<!-- bot:review -->` comment.
 
 Diff comes from a file (the workflow runs `gh pr diff`). Inference uses
-GROQ_API_KEY / MODELS_PAT (see llm_client); posting uses GH_TOKEN. PR number =
-the triggering comment's issue.
+NVIDIA_API_KEY / GROQ_API_KEY / MODELS_PAT (see llm_client); posting uses
+GH_TOKEN. PR number = the triggering comment's issue.
 """
 
 import json
@@ -16,24 +16,45 @@ import os
 from pathlib import Path
 
 from scripts import gh, limits, repo_context
-from scripts.config import AUTO_APPROVE, CONTEXT_MAX_TREE_CHARS, MAX_DIFF_CHARS, REVIEW_LARGE_DIFF_CHARS
+from scripts.config import (
+    AUTO_APPROVE,
+    CONTEXT_MAX_TREE_CHARS,
+    MAX_DIFF_CHARS,
+    MODEL_INPUT_CHARS,
+    MODELS,
+    REVIEW_LARGE_DIFF_CHARS,
+)
 from scripts.diff_anchors import anchors, number_diff, strip_noise
 from scripts.llm_client import complete, truncate_diff
 
 _INLINE_MARKER = "bot:review-inline"
 
-# Shown on the large-PR path so the reader knows a high-throughput model swept the
-# whole diff in one pass (broad attention) rather than the smarter, smaller-budget
-# model used on normal PRs. Reflects the routing tier, not the exact responder.
-_LARGE_NOTE = (
-    "> 🐱 Big PR — I reviewed this with **Llama-4 Scout**, a high-throughput model "
-    "that reads the entire diff in one pass for broad attention rather than deep "
-    "line-by-line. Treat it as a wide first sweep; split the PR and `/review` again "
-    "for a closer look.\n\n"
-)
+# Friendly display names for review models — config's ids are ugly for user copy.
+_MODEL_LABELS = {
+    "z-ai/glm-5.2": "GLM-5.2",
+    "minimaxai/minimax-m2.7": "MiniMax-M2.7",
+    "meta-llama/llama-4-scout-17b-16e-instruct": "Llama-4 Scout",
+    "groq/compound": "Groq Compound",
+}
+
+
+def _large_note(model: str) -> str:
+    """Big-PR disclaimer that names the model which actually answered — the large
+    tier is NVIDIA-first (GLM-5.2) now, so hardcoding a fallback would misreport it.
+    Falls back to the tier's primary label when the responder is unknown."""
+    label = _MODEL_LABELS.get(model, model)
+    return (
+        f"> 🐱 Big PR — I reviewed the whole diff in one pass with **{label}**. "
+        "Treat it as a wide first sweep; split the PR and `/review` again for a "
+        "closer look.\n\n"
+    )
+
 
 _SYSTEM = (
-    "You are a meticulous senior software engineer code reviewer. Review only the changes in the diff. "
+    "You are a meticulous senior software engineer code reviewer. Review only the changes in the diff, "
+    "but judge them against everything you're given: flag a change that violates the repo conventions, "
+    "contradicts the PR's own description, or plausibly breaks a caller/consumer the project context "
+    "shows exists outside the diff.\n"
     "Respond with ONLY a single JSON object (no prose, no markdown fence) shaped as:\n"
     '{"verdict": "approve|comment|request_changes", "summary": "<markdown>", '
     '"issues": [{"path": "<file>", "line": <int>, '
@@ -214,23 +235,31 @@ def run(repo, pr_number, diff):
     large = len(diff) > MAX_DIFF_CHARS
     task = "review_large" if large else "review"
     max_chars = REVIEW_LARGE_DIFF_CHARS if large else MAX_DIFF_CHARS
-    note = _LARGE_NOTE if large else ""
+
+    conventions = gh.get_file_text(repo, "CLAUDE.md") or ""  # target repo's rubric
+    project_context = repo_context.ensure_fresh(repo)
+    pr_text = f"{pr.title}\n\n{pr.body or ''}".strip()
+    used: list = []  # complete() appends the (provider, model) that answered
+    # Numbered BEFORE truncation so the prefixes always match the real file lines.
+    numbered = number_diff(diff)
+
+    def prompt_for(model: str) -> str:
+        # Prompt sized per attempt: large-context models (NVIDIA) take the diff at
+        # their own budget; the Groq/GitHub fallbacks keep the tier cap they were
+        # TPM-tuned for. Same diff, different truncation point.
+        cap = MODEL_INPUT_CHARS.get(model, max_chars)
+        return build_prompt(numbered, conventions, cap, pr_text, project_context)
+
+    raw = complete(_SYSTEM, prompt_for, task, json_mode=True, used=used)
+
+    # Disclaimers built AFTER the call so the big-PR note names the model that
+    # actually answered (falls back to the tier's primary if the call failed).
+    note = _large_note(used[0][1] if used else MODELS[task][0][1]) if large else ""
     if incremental:
         note = (
             f"> 🐱 Incremental review — only the changes since `{prev[:7]}`; "
             "earlier threads on untouched files were left as-is.\n\n"
         ) + note
-
-    conventions = gh.get_file_text(repo, "CLAUDE.md") or ""  # target repo's rubric
-    project_context = repo_context.ensure_fresh(repo)
-    pr_text = f"{pr.title}\n\n{pr.body or ''}".strip()
-    # Numbered BEFORE truncation so the prefixes always match the real file lines.
-    raw = complete(
-        _SYSTEM,
-        build_prompt(number_diff(diff), conventions, max_chars, pr_text, project_context),
-        task,
-        json_mode=True,
-    )
 
     data = parse_response(raw)
     if data is None:

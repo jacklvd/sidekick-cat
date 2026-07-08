@@ -8,7 +8,7 @@ import httpx
 from openai import APIConnectionError, APIStatusError
 
 from scripts import limits, llm_client
-from scripts.config import MODELS
+from scripts.config import MODEL_INPUT_CHARS, MODELS
 
 
 def test_truncate():
@@ -19,9 +19,39 @@ def test_truncate():
 
 
 def test_review_order():
-    # Review precedence is explicit and crosses providers: qwen → GitHub → gpt-oss.
-    assert [p for p, _ in MODELS["review"]] == ["groq", "github", "groq"]
-    assert MODELS["review"][0] == ("groq", "qwen/qwen3-32b")
+    # Review precedence is explicit and crosses providers, NVIDIA-first for quality:
+    # GLM-5.2 → MiniMax-M2.7 → qwen → GitHub → gpt-oss.
+    assert [p for p, _ in MODELS["review"]] == ["nvidia", "nvidia", "groq", "github", "groq"]
+    assert MODELS["review"][0] == ("nvidia", "z-ai/glm-5.2")
+    # Every provider named in any task must be a registered _PROVIDERS entry, else
+    # complete() would KeyError-skip it silently (a wrong provider name = dead tier).
+    named = {p for tier in MODELS.values() for p, _ in tier}
+    assert named <= set(llm_client._PROVIDERS)
+    # Every per-model input budget must belong to a model some tier actually uses,
+    # else it's dead config (a typo'd id silently drops the model to the tier cap).
+    in_tiers = {m for tier in MODELS.values() for _, m in tier}
+    assert set(MODEL_INPUT_CHARS) <= in_tiers
+
+
+def test_callable_user_builds_prompt_per_model():
+    # `user` as a callable is invoked with each attempt's model id, so a fallback
+    # after a 429 gets a prompt rebuilt (re-truncated) for the model actually tried.
+    (_, first), (_, second) = MODELS["review"][:2]
+    seen = []
+
+    def fake(provider, system, user, model, json_mode=False):
+        seen.append((model, user))
+        if model == first:
+            resp = httpx.Response(429, request=httpx.Request("POST", "http://x"))
+            raise APIStatusError("rate limited", response=resp, body=None)
+        return "ok"
+
+    restore = _patch(fake)
+    try:
+        assert llm_client.complete("s", lambda m: f"prompt-for-{m}", "review") == "ok"
+        assert seen == [(first, f"prompt-for-{first}"), (second, f"prompt-for-{second}")]
+    finally:
+        restore()
 
 
 def _patch(fake):
@@ -86,6 +116,7 @@ def test_status_error_advances_to_next_entry():
 if __name__ == "__main__":
     test_truncate()
     test_review_order()
+    test_callable_user_builds_prompt_per_model()
     test_fallback_on_primary_error()
     test_both_fail_returns_quota_msg()
     test_status_error_advances_to_next_entry()
