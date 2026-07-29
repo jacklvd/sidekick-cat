@@ -32,9 +32,14 @@ _INLINE_MARKER = "bot:review-inline"
 # Friendly display names for review models — config's ids are ugly for user copy.
 _MODEL_LABELS = {
     "z-ai/glm-5.2": "GLM-5.2",
+    "nvidia/nemotron-3-ultra-550b-a55b": "Nemotron-3-Ultra",
+    "deepseek-ai/deepseek-v4-pro": "DeepSeek-V4-Pro",
     "minimaxai/minimax-m2.7": "MiniMax-M2.7",
-    "meta-llama/llama-4-scout-17b-16e-instruct": "Llama-4 Scout",
-    "groq/compound": "Groq Compound",
+    "mistralai/mistral-medium-3.5-128b": "Mistral-Medium-3.5",
+    "qwen/qwen3.5-122b-a10b": "Qwen3.5-122B",
+    "qwen/qwen3.6-27b": "Qwen3.6-27B",
+    "openai/gpt-oss-120b": "GPT-OSS-120B",
+    "openai/gpt-4.1": "GPT-4.1",
 }
 
 
@@ -48,7 +53,6 @@ def _large_note(model: str) -> str:
         "Treat it as a wide first sweep; split the PR and `/review` again for a "
         "closer look.\n\n"
     )
-
 
 _SYSTEM = (
     "You are a meticulous senior software engineer code reviewer. Review only the changes in the diff, "

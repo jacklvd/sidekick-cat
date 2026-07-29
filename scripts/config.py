@@ -16,39 +16,90 @@ GROQ_BASE = "https://api.groq.com/openai/v1"
 GH_MODELS_BASE = MODELS_BASE_URL
 # NVIDIA NIM — OpenAI-compatible free endpoint (build.nvidia.com). Auth: NVIDIA_API_KEY
 # (an `nvapi-...` key). RPM-limited (not Groq's tokens-per-minute ceiling), large-context,
-# so it leads the review tiers for quality. Both models honor json_object mode cleanly and
-# keep any reasoning out of message.content (verified live) — required, since /review calls
-# with json_mode=True. dev-note: Kimi-K2.6 was rejected — it returns garbage in json mode on
-# NIM (200, not 400, so _call's retry-plain never fires); smoke any new NVIDIA model in json
-# mode before adding it here, not just plain.
+# so it leads the review tiers for quality. Every model here honors json_object mode cleanly
+# and keeps any reasoning out of message.content (verified live) — required, since /review
+# calls with json_mode=True.
+# dev-note: smoke any new NVIDIA model in *json* mode, on the *real* review prompt, before
+# adding it. Not just plain, and not on a toy prompt — a NIM model can fail json while passing
+# plain, and it fails at 200 (not 400), so _call's retry-plain never fires. Rejected this way,
+# all verified live on 2026-07-13:
+#   kimi-k2.6            — returns garbage in json mode.
+#   minimaxai/minimax-m3 — 200 with `choices: []`, every time, json *and* plain. Empty body.
+#   deepseek-v4-flash    — prefixes the JSON with a literal "We" (`We{"verdict": ...}`), 3/3,
+#                          so json.loads dies in review_pr.parse_response. Same trap as kimi.
+#                          Note this is the *flash* model; deepseek-v4-pro is clean and wired.
+#
+# NVIDIA rungs are ordered by measured behavior on the real review prompt, not by parameter
+# count (6 runs each, 2026-07-13 — median latency / issues found on a diff with a known bug):
+#   GLM-5.2       17.1s / 2.5   flagship coding model; still the best reviewer here
+#   Nemotron      9.5s  / 2.3   fastest *and* nearly GLM's hit rate — the standout
+#   DeepSeek-Pro  20.4s / 1.3
+#   MiniMax-M2.7  incumbent
+#   Mistral       23.3s / 1.2   slowest; 139s on a 200K-char prompt
+#   Qwen3.5       30-140s       last: the only NVIDIA model that returns an empty body
+#                               (~1 call in 8), and the slowest. Kept because it's a fine
+#                               reviewer when it answers, and NoReply now absorbs the flake.
+# All six hold a 200K-char prompt (~50K tokens), which is the point of leading with NIM.
 NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
 NVIDIA_GLM = "z-ai/glm-5.2"  # flagship coding/agentic; review primary, both size tiers
+NVIDIA_NEMOTRON = "nvidia/nemotron-3-ultra-550b-a55b"  # fastest large-context rung
+NVIDIA_DEEPSEEK = "deepseek-ai/deepseek-v4-pro"  # NB: the *pro* model; -flash is broken, see above
 NVIDIA_MINIMAX = "minimaxai/minimax-m2.7"  # reasoning model; review fallback
+NVIDIA_MISTRAL = "mistralai/mistral-medium-3.5-128b"
+NVIDIA_QWEN = "qwen/qwen3.5-122b-a10b"  # sparse MoE; flaky (see ordering note), so it goes last
 
 # task -> ordered list of (provider, model). Tried first-to-last; first success wins.
-# Review is size-routed (see review_pr.run), NVIDIA-first for quality then Groq/GitHub fallback:
-#   "review"       — small PRs: GLM-5.2 → MiniMax-M2.7 → qwen → gpt-4.1 → gpt-oss.
-#   "review_large" — big PRs: GLM-5.2 (large ctx) → MiniMax-M2.7 → Scout 30K TPM → compound → gpt-4.1.
-#                    The Groq "smart" models cap at 6-8K TPM and would truncate a big diff.
+# Review is size-routed (see review_pr.run): both tiers run the same six NVIDIA rungs first (see
+# the ordering note above), then leave NIM for the Groq/GitHub backstops. The two tiers differ
+# only in what happens *after* NVIDIA — and in how much diff each rung is handed
+# (MODEL_INPUT_CHARS), which is the whole reason NVIDIA leads.
+#   "review"       — small PRs: …NVIDIA… → qwen3.6-27b → gpt-4.1 → gpt-oss-120b.
+#   "review_large" — big PRs:   …NVIDIA… → gpt-4.1 → gpt-oss-120b (no qwen3.6: its Groq TPM
+#                    budget can't hold a large diff, so it would only ever 413 here).
+# A long chain is cheap: a rung costs nothing unless the one above it fails.
 # "context" also leads with GLM-5.2: the repo-context brief is folded into every review prompt,
 # so a sharper brief pays off downstream. "summary" stays on Groq — a throwaway per-PR one-liner
 # not worth NVIDIA's RPM budget.
+#
+# dev-note: Groq decommissions `qwen/qwen3-32b` (was the "review" rung) and
+# `meta-llama/llama-4-scout-17b-16e-instruct` (was "review_large") on 2026-07-17, free/dev tier.
+# Replaced with the models Groq itself names, both verified live in json mode on 2026-07-13:
+# qwen3-32b → `qwen/qwen3.6-27b`, Scout → `openai/gpt-oss-120b`.
+#
+# `review_large` fallbacks are ordered by how big a request each will actually accept, because
+# on a size-routed tier that is the only thing that decides whether a rung can answer at all
+# (measured live, prompt chars before a 413): NVIDIA ~unbounded → gpt-4.1 dies past ~18K →
+# gpt-oss-120b dies past ~11K. A 413 is handled, not fatal — complete() moves to the next model
+# without tripping the breaker — so the small rungs still earn their place on the mid-size PRs
+# that land just over MAX_DIFF_CHARS, while the NVIDIA rungs carry the monsters.
+#
+# dev-note: `groq/compound` was dropped from review_large, not replaced. It 413s on a 3.6K-char
+# prompt — smaller than anything this tier sends — so it could never answer here; it only ever
+# burned a fallback attempt. (Its 429 also names `meta-llama/llama-4-scout` as its backing
+# model, so the 2026-07-17 decommission likely lands on it anyway.)
 MODELS = {
     "summary": [("groq", "llama-3.1-8b-instant"), ("github", SUMMARY_MODEL)],
     "context": [("nvidia", NVIDIA_GLM), ("groq", "llama-3.1-8b-instant"), ("github", SUMMARY_MODEL)],
     "review": [
         ("nvidia", NVIDIA_GLM),
+        ("nvidia", NVIDIA_NEMOTRON),
+        ("nvidia", NVIDIA_DEEPSEEK),
         ("nvidia", NVIDIA_MINIMAX),
-        ("groq", "qwen/qwen3-32b"),
+        ("nvidia", NVIDIA_MISTRAL),
+        ("nvidia", NVIDIA_QWEN),
+        ("groq", "qwen/qwen3.6-27b"),
         ("github", REVIEW_MODEL),
         ("groq", "openai/gpt-oss-120b"),
     ],
     "review_large": [
         ("nvidia", NVIDIA_GLM),
+        ("nvidia", NVIDIA_NEMOTRON),
+        ("nvidia", NVIDIA_DEEPSEEK),
         ("nvidia", NVIDIA_MINIMAX),
-        ("groq", "meta-llama/llama-4-scout-17b-16e-instruct"),
-        ("groq", "groq/compound"),
+        ("nvidia", NVIDIA_MISTRAL),
+        ("nvidia", NVIDIA_QWEN),
         ("github", REVIEW_MODEL),
+        ("groq", "openai/gpt-oss-120b"),
     ],
 }
 
@@ -88,10 +139,34 @@ REVIEW_LARGE_DIFF_CHARS = 56000
 # dev-note: 200K chars ≈ 50K tokens — deliberately conservative for 128K-ctx
 # models; raise after a live /review smoke on a monster PR.
 NVIDIA_INPUT_CHARS = 200_000
+# Every NVIDIA rung gets the large budget — all six were verified live against a 203K-char
+# prompt (~50K tokens). A model missing from this map silently drops to the caller's tier cap
+# (12K chars on the small path), so it would review a fraction of the diff and never complain.
 MODEL_INPUT_CHARS = {
-    NVIDIA_GLM: NVIDIA_INPUT_CHARS,
-    NVIDIA_MINIMAX: NVIDIA_INPUT_CHARS,
+    m: NVIDIA_INPUT_CHARS
+    for m in (NVIDIA_GLM, NVIDIA_NEMOTRON, NVIDIA_DEEPSEEK, NVIDIA_MINIMAX, NVIDIA_MISTRAL, NVIDIA_QWEN)
 }
+
+# Per-provider output cap. Not tuning — both entries fix a real, reproduced failure, and
+# the two providers fail in *opposite* directions, which is why one global number can't work.
+#
+# Reasoning models spend tokens thinking before they emit a single character of JSON, so the
+# output cap has to cover think + answer. Too low and the model is cut off mid-thought:
+#   nvidia — NIM defaults qwen3.5-122b to 128 completion tokens. A toy reply fits, so the
+#     model smokes clean, but a real review's JSON is guillotined mid-string. It still comes
+#     back 200, choices populated, text opening `{"verdict": ...` — so nothing raises and
+#     parse_response silently returns None. The review is lost with no error anywhere.
+#   groq — with no cap, qwen3.6-27b burns its default budget inside <think> and emits nothing,
+#     so Groq itself rejects the call (400 json_validate_failed, failed_generation empty).
+#     _call then retries plain and gets back raw reasoning prose that won't parse.
+# But too high and Groq 413s: its free tier bills max_tokens against the per-request TPM
+# budget *up front*, so 8000 is an instant "request too large" even on "say hello". 4000 both
+# passes that check and leaves qwen3.6 room to finish (it used 3855 on a 2-issue review).
+#
+# GitHub is absent on purpose — its default already lets a review finish.
+# dev-note: every number here verified live 2026-07-13. If a new model returns
+# finish_reason='length', it needs more room, not a smaller diff.
+PROVIDER_MAX_TOKENS = {"nvidia": 8000, "groq": 4000}
 
 # Deterministic PR-open.
 # Sections the PR description must contain (matched as line-leading headings,

@@ -72,10 +72,29 @@ def test_record_success_clears_streak():
     assert limits.breaker_open() is False
 
 
+def test_success_ends_an_open_cooldown():
+    # complete() records a failure per fallback *rung*, and the review tiers run six NVIDIA
+    # rungs — so one review on a bad NVIDIA day burns more than BREAKER_FAILS and opens the
+    # breaker mid-call, even though a lower rung then answers fine. If that success didn't
+    # clear the cooldown, a review that demonstrably worked would be followed by 15 minutes
+    # of "AI quota reached".
+    limits._reset()
+    for _ in range(BREAKER_FAILS):  # the NVIDIA rungs failing inside one complete() call
+        limits.record_failure()
+    assert limits.breaker_open() is True
+    limits.record_success()  # ...then a lower rung answers
+    assert limits.breaker_open() is False  # the system works; stop blocking it
+    # a real outage still trips it: nothing succeeds, so nothing clears it
+    for _ in range(BREAKER_FAILS):
+        limits.record_failure()
+    assert limits.breaker_open() is True
+
+
 if __name__ == "__main__":
     test_per_pr_cap_blocks_and_isolates()
     test_reviewed_head()
     test_breaker_opens_then_cools_down()
     test_breaker_window_prunes_old_failures()
     test_record_success_clears_streak()
+    test_success_ends_an_open_cooldown()
     print("ok")
