@@ -373,7 +373,7 @@ def run(repo, pr_number, diff):
     head_sha = pr.head.sha
     prev = limits.reviewed_head(repo.full_name, pr_number)
     if prev == head_sha:
-        return  # unchanged head already reviewed — re-review is free + idempotent
+        return "done"  # unchanged head already reviewed — let the check settle to its verdict
 
     # Incremental: a previously reviewed PR only gets its NEW commits re-read —
     # cheaper, usually fits the smart tier, and untouched files keep their threads.
@@ -394,7 +394,7 @@ def run(repo, pr_number, diff):
         # so the next push compares from here, and stay silent: "nothing to review" on
         # every dependency bump is noise the author never asked for.
         limits.record_reviewed_head(repo.full_name, pr_number, head_sha)
-        return
+        return "done"  # nothing reviewable = clean; the head is recorded, the check settles
 
     # Gate immediately before the model call. This is a cap on *LLM calls*, so the two
     # GitHub reads above — which may legitimately find nothing to review — must not
@@ -407,7 +407,7 @@ def run(repo, pr_number, diff):
             "bot:ratelimit",
             f"🐱 Sidekick is taking a breather — {reason}. Try again later.",
         )
-        return
+        return "failed"  # no review ran — the check goes neutral, not a false verdict
     # Size-route: small PRs go to the smart tier; big diffs to the high-TPM tier so
     # the whole thing fits one pass (and the large path may send a bigger diff). The
     # threshold is the small model's truncation cap — over it, qwen would truncate.
@@ -492,7 +492,7 @@ def run(repo, pr_number, diff):
         gh.upsert_comment(
             repo, pr_number, "bot:review", "### 🐱 Sidekick's code review\n" + note + raw
         )
-        return
+        return "failed" if failed(raw) else "done"
 
     verdict = str(data.get("verdict", "comment")).strip().lower()
     issues = [it for it in (data.get("issues") or []) if isinstance(it, dict)]
@@ -520,6 +520,8 @@ def run(repo, pr_number, diff):
             "Approved by Sidekick after comprehensive review.",
             "APPROVE",
         )
+
+    return "done"
 
 
 def main():

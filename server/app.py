@@ -7,12 +7,13 @@ and the LLM keys are read by lower layers.
 /webhook verifies HMAC on the raw body, drops bot/irrelevant events fast,
 dedupes deliveries, acks (202), and hands the real work to a background task.
 The background flows: pr_open runs the deterministic flow (welcome+assign,
-validate, label) plus the gated AI review when the router says this event earns
-one; pr_update re-runs the deterministic checks and reviews on new commits;
-/review forces a review by hand (the only way to review a draft); /merge runs the
-merge gate; /context (re)generates the cached project-context doc; a reply in a
-bot review thread runs `reply_thread`. All reuse the scripts' host-agnostic
-run() cores.
+validate, label); pr_open and pr_update run the gated AI review when the router
+says the event earns one, wrapped in a Sidekick check run (in_progress before,
+concluded after); an `edited` and a thread resolve/unresolve deferentially
+refresh that check; /review forces a review by hand (the only way to review a
+draft); /merge runs the merge gate; /context (re)generates the cached
+project-context doc; a reply in a bot review thread runs `reply_thread`. All
+reuse the scripts' host-agnostic run() cores.
 """
 
 import logging
@@ -20,7 +21,7 @@ import os
 
 from fastapi import BackgroundTasks, FastAPI, Request, Response
 
-from scripts import gh, label_pr, merge_pr, repo_context, reply_thread, review_pr, validate_pr, welcome
+from scripts import check_run, gh, label_pr, merge_pr, repo_context, reply_thread, review_pr, validate_pr, welcome
 from scripts.gh import get_pr_diff, repo_from_token
 from scripts.limits import delivery_seen
 from server.gh_app_auth import installation_token
@@ -63,17 +64,17 @@ def dispatch(intent: dict) -> None:
             _safe("welcome", welcome.run, repo, number, intent.get("author"))
             _safe("validate", validate_pr.run, repo, number)
             _safe("label", label_pr.run, repo, number)
-            if intent.get("review"):
-                _safe("review", _review, repo, full_name, number, token)
+            _review_and_check(repo, full_name, number, token, intent)
         elif kind == "pr_update":
             # PR changed after open: recheck the description and relabel. Both are
             # idempotent upserts, so the ❌/✅ flag and labels track the latest state.
             _safe("validate", validate_pr.run, repo, number)
             _safe("label", label_pr.run, repo, number)
-            # Only when the router says this event changed code on a non-draft — an
-            # `edited` shares this kind and must not trigger a review.
-            if intent.get("review"):
-                _safe("review", _review, repo, full_name, number, token)
+            _review_and_check(repo, full_name, number, token, intent)
+        elif kind == "check":
+            # A human resolved/unresolved a thread → deferential recompute. refresh
+            # never creates a check, so this is a no-op on a head that never reviewed.
+            _safe("check", check_run.refresh, repo, number, token)
         elif kind == "command" and intent.get("command") == "review":
             gh.react(repo, number, intent["comment_id"])  # 👀 immediate ack on the comment
             review_pr.run(repo, number, get_pr_diff(full_name, number, token))
@@ -100,9 +101,24 @@ def dispatch(intent: dict) -> None:
         log.exception("dispatch failed for %s", kind)
 
 
-def _review(repo, full_name: str, number, token: str) -> None:
-    """Fetch the diff (REST, no `gh` CLI) and run the gated AI review."""
-    review_pr.run(repo, number, get_pr_diff(full_name, number, token))
+def _review_and_check(repo, full_name: str, number, token: str, intent: dict) -> None:
+    """Run the gated review and drive the check around it. Only a code change on a
+    non-draft reviews (intent['review']); everything else (an `edited`) just refreshes
+    the check, so fixing the description turns it green without a push."""
+    if not intent.get("review"):
+        _safe("check", check_run.refresh, repo, number, token)
+        return
+    # gate 1: this head has a review in flight — mark it before the (slow) review so
+    # the check can't read green mid-run. conclude always writes; refresh never would.
+    _safe("check-pending", check_run.conclude, repo, number, token, "pending")
+    state = _review(repo, full_name, number, token)  # "done" | "failed"
+    _safe("check", check_run.conclude, repo, number, token, state)
+
+
+def _review(repo, full_name: str, number, token: str) -> str:
+    """Fetch the diff (REST, no `gh` CLI) and run the gated AI review. Returns
+    "done"/"failed" so the caller can conclude the check."""
+    return review_pr.run(repo, number, get_pr_diff(full_name, number, token))
 
 
 def _safe(name: str, fn, *args) -> None:

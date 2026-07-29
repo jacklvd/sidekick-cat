@@ -33,6 +33,32 @@ def graphql(token, query, variables):
         return json.loads(resp.read())
 
 
+def get_check_run(repo, head_sha, name):
+    """The check run named `name` on `head_sha`, or None. `get_check_runs` filters
+    server-side by name, so the first result is the one we own (only this App creates
+    a check by this name)."""
+    for run in repo.get_commit(head_sha).get_check_runs(check_name=name):
+        return run
+    return None
+
+
+def upsert_check_run(repo, head_sha, name, status, conclusion, title, summary):
+    """Write the check idempotently: edit the run of this name on the head if it
+    exists, else create it. `create_check_run` is NOT idempotent — the same name on
+    the same head yields a duplicate row — so two racing dispatches would otherwise
+    show two Sidekick checks. Name is the natural key, same principle as upsert_comment.
+
+    `conclusion` is None for an in_progress check; omit it rather than send null."""
+    kwargs = {"status": status, "output": {"title": title, "summary": summary}}
+    if conclusion is not None:
+        kwargs["conclusion"] = conclusion
+    existing = get_check_run(repo, head_sha, name)
+    if existing is not None:
+        existing.edit(**kwargs)
+    else:
+        repo.create_check_run(name=name, head_sha=head_sha, **kwargs)
+
+
 def get_pr_diff(full_name, number, token):
     """Raw unified diff for a PR via REST — the Cloud Run analog of `gh pr diff`
     (no `gh` CLI in the container).

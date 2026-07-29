@@ -6,6 +6,7 @@ workflow `if:` guards. Pure function, so it self-checks offline.
   - "pr_open"      : run the PR-open flow
   - "pr_update"    : run the PR-update flow
   - "command"      : run a slash command ("review" | "merge" | "context")
+  - "check"        : recompute the Sidekick check run after a thread resolve/unresolve
   - "thread_reply" : answer an author's reply in a bot review thread
 
 `pr_open` / `pr_update` also carry `review: bool` — whether this event earns an AI
@@ -90,6 +91,16 @@ def classify(event: str, body: dict) -> dict:
             "kind": "command", "command": command, "owner": owner, "repo": repo,
             "number": issue.get("number"), "comment_id": comment.get("id"),
             "installation_id": installation_id,
+        }
+
+    # A human resolved/unresolved a review thread → recompute the check (deferential;
+    # see check_run.refresh). The bot's own resolutions are dropped by the loop guard
+    # above. Needs only Pull requests: read; the check itself is written elsewhere.
+    if event == "pull_request_review_thread" and action in {"resolved", "unresolved"}:
+        pr = body.get("pull_request", {})
+        return {
+            "kind": "check", "owner": owner, "repo": repo,
+            "number": pr.get("number"), "installation_id": installation_id,
         }
 
     # An author replying inside a review thread → let Sidekick answer there. Only

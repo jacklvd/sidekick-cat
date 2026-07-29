@@ -1165,6 +1165,50 @@ def test_reply_thread_run_only_answers_bot_threads():
         limits._reset()
 
 
+def test_review_run_returns_done_or_failed():
+    import scripts.review_pr as rp
+    from scripts import limits
+    from scripts import llm_client
+    from scripts.config import PR_DAILY_MAX
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h0"}), "title": "t", "body": ""})()
+
+    orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+            rp.repo_context.ensure_fresh)
+    rp.gh.upsert_comment = lambda repo, n, marker, body: None
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
+    rp.reconcile_inline = lambda *a, **k: None
+    rp.repo_context.ensure_fresh = lambda repo: ""
+    try:
+        # A model that answers with parseable JSON -> "done".
+        rp.complete = lambda s, u, t, **kw: '{"verdict":"approve","summary":"ok","issues":[]}'
+        limits._reset()
+        assert rp.run(FakeRepo(), 1, _block("app.py")) == "done"
+
+        # A noise-only diff reviews nothing -> still "done" (clean, not failed).
+        limits._reset()
+        assert rp.run(FakeRepo(), 1, _block("uv.lock")) == "done"
+
+        # A model that returns a sentinel (quota/outage) -> "failed".
+        rp.complete = lambda s, u, t, **kw: llm_client._QUOTA_MSG
+        limits._reset()
+        assert rp.run(FakeRepo(), 1, _block("app.py")) == "failed"
+
+        # Over the daily cap -> "failed" (no review ran).
+        limits._reset()
+        for _ in range(PR_DAILY_MAX):
+            assert limits.allow_llm_call("o/r", 1)[0]
+        assert rp.run(FakeRepo(), 1, _block("app.py")) == "failed"
+    finally:
+        (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+         rp.repo_context.ensure_fresh) = orig
+        limits._reset()
+
+
 def test_review_skips_when_the_noise_strip_leaves_nothing():
     # A lockfile-only push: strip_noise eats the whole diff. Reviewing what's left would
     # ask a model to review nothing AND spend a budget unit doing it. Silence, not a
@@ -1458,6 +1502,7 @@ if __name__ == "__main__":
     test_reply_thread_prompt_pieces()
     test_reply_thread_run_only_answers_bot_threads()
     test_reply_thread_bills_its_own_bucket()
+    test_review_run_returns_done_or_failed()
     test_review_skips_when_the_noise_strip_leaves_nothing()
     test_review_does_not_burn_the_head_when_no_model_answers()
     print("ok")

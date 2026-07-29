@@ -81,6 +81,26 @@ def test_classify():
     # A truly unhandled PR action is still ignored.
     assert classify("pull_request", {"action": "labeled", "sender": {"login": "a"}})["kind"] == "ignore"
 
+    # A human resolving/unresolving a review thread -> recompute the check.
+    t = classify("pull_request_review_thread", {
+        "action": "resolved", "sender": {"login": "alice"},
+        "repository": {"full_name": "alice/repo"},
+        "pull_request": {"number": 7}, "installation": {"id": 99},
+    })
+    assert t == {"kind": "check", "owner": "alice", "repo": "repo",
+                 "number": 7, "installation_id": 99}
+    assert classify("pull_request_review_thread", {
+        "action": "unresolved", "sender": {"login": "a"},
+        "pull_request": {"number": 7}})["kind"] == "check"
+    # The bot resolving its own thread -> ignored by the loop guard.
+    assert classify("pull_request_review_thread", {
+        "action": "resolved", "sender": {"type": "Bot"},
+        "pull_request": {"number": 7}})["kind"] == "ignore"
+    # An unhandled thread action -> ignored.
+    assert classify("pull_request_review_thread", {
+        "action": "edited", "sender": {"login": "a"},
+        "pull_request": {"number": 7}})["kind"] == "ignore"
+
     base = {
         "action": "created", "sender": {"login": "alice"},
         "repository": {"full_name": "alice/repo"},
