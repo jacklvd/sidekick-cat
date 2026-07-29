@@ -776,13 +776,15 @@ def test_review_incremental():
 
     full = _block("full.py", "+base\n") + _block("changed.py", "+base\n")
     orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text,
-            rp.reconcile_inline, rp.gh.compare_diff, rp.repo_context.ensure_fresh)
+            rp.reconcile_inline, rp.gh.compare_diff, rp.gh.get_inline_comments,
+            rp.repo_context.ensure_fresh)
     # `u` is a per-model prompt builder now — resolve it the way complete() would.
     rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, m, body: bodies.append(body)
     rp.gh.get_file_text = lambda repo, path, ref=None: ""
     rp.reconcile_inline = lambda repo, n, s, anch, scope=None: scopes.append(scope)
     rp.gh.compare_diff = lambda repo, base, head: _block("changed.py", "+delta\n")
+    rp.gh.get_inline_comments = lambda repo, n, marker: []
     rp.repo_context.ensure_fresh = lambda repo: ""
     try:
         limits._reset()
@@ -805,7 +807,8 @@ def test_review_incremental():
         assert "full.py" in prompts[2] and scopes[2] is None  # fallback: full review
     finally:
         (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text,
-         rp.reconcile_inline, rp.gh.compare_diff, rp.repo_context.ensure_fresh) = orig
+         rp.reconcile_inline, rp.gh.compare_diff, rp.gh.get_inline_comments,
+         rp.repo_context.ensure_fresh) = orig
         limits._reset()
 
 
@@ -988,6 +991,80 @@ def test_build_prompt_includes_file_contents():
     assert "1| x = 1" not in build_prompt("DIFF", conventions="rules")  # optional
 
 
+def test_prior_issues_text_roots_in_scope_only():
+    from scripts.review_pr import prior_issues_text
+
+    class C:
+        def __init__(self, path, line, body, reply_to=None):
+            self.path, self.line, self.body = path, line, body
+            self.in_reply_to_id = reply_to
+
+    comments = [
+        C("a.py", 10, "**[major]** off-by-one here\n<!-- bot:review-inline -->"),
+        C("a.py", 20, "a human reply", reply_to=999),   # reply, not a root -> excluded
+        C("b.py", 5, "**[nit]** rename this\n<!-- bot:review-inline -->"),  # out of scope
+    ]
+    out = prior_issues_text(comments, scope={"a.py"})
+    assert "a.py:10" in out and "off-by-one here" in out
+    assert "<!-- bot:review-inline -->" not in out  # marker stripped
+    assert "**[major]**" not in out                  # severity prefix stripped
+    assert "b.py" not in out                          # scope excludes it
+    assert "a.py:20" not in out                       # reply excluded
+    assert prior_issues_text([], scope={"a.py"}) == ""
+
+
+def test_build_prompt_includes_prior_issues():
+    from scripts.review_pr import build_prompt
+
+    p = build_prompt("DIFF", conventions="rules", prior_issues="- a.py:10 — off-by-one")
+    assert "a.py:10 — off-by-one" in p
+    assert p.index("a.py:10") < p.index("DIFF")       # history before the new diff
+    assert "do NOT report it again" in p              # the fix-confirmation instruction
+    assert "a.py:10" not in build_prompt("DIFF", conventions="rules")  # optional
+
+
+def test_run_feeds_prior_issues_on_incremental():
+    import scripts.review_pr as rp
+    from scripts import limits
+
+    prompts, sha = [], {"v": "h1"}
+
+    class C:
+        def __init__(self, path, line, body, reply_to=None):
+            self.path, self.line, self.body = path, line, body
+            self.in_reply_to_id = reply_to
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": sha["v"]}), "title": "t", "body": ""})()
+
+    full = _block("changed.py", "+base\n")
+    orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+            rp.gh.compare_diff, rp.gh.get_inline_comments, rp.repo_context.ensure_fresh)
+    rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
+    rp.gh.upsert_comment = lambda repo, n, m, body: None
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
+    rp.reconcile_inline = lambda *a, **k: None
+    rp.gh.compare_diff = lambda repo, base, head: _block("changed.py", "+delta\n")
+    rp.gh.get_inline_comments = lambda repo, n, marker: [
+        C("changed.py", 1, "**[major]** still broken\n<!-- bot:review-inline -->"),
+    ]
+    rp.repo_context.ensure_fresh = lambda repo: ""
+    try:
+        limits._reset()
+        rp.run(FakeRepo(), 1, full)                 # first review: full, no prior section
+        assert "still broken" not in prompts[0]
+        sha["v"] = "h2"
+        rp.run(FakeRepo(), 1, full)                 # incremental: prior issues folded in
+        assert "still broken" in prompts[1] and "changed.py:1" in prompts[1]
+    finally:
+        (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+         rp.gh.compare_diff, rp.gh.get_inline_comments, rp.repo_context.ensure_fresh) = orig
+        limits._reset()
+
+
 if __name__ == "__main__":
     test_missing_sections()
     test_labels_for()
@@ -1031,4 +1108,7 @@ if __name__ == "__main__":
     test_blockers()
     test_unresolved_count()
     test_merge_gating()
+    test_prior_issues_text_roots_in_scope_only()
+    test_build_prompt_includes_prior_issues()
+    test_run_feeds_prior_issues_on_incremental()
     print("ok")

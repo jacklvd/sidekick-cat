@@ -175,6 +175,7 @@ def build_prompt(
     project_context: str | None = None,
     symbol_outline: str | None = None,
     file_contents: str | None = None,
+    prior_issues: str | None = None,
 ) -> str:
     """Compose the review prompt. `conventions` is the target repo's CLAUDE.md text
     (Cloud Run fetches it via API); when None, fall back to a local file (Actions).
@@ -185,8 +186,10 @@ def build_prompt(
     what each changed file *already* defines outside the hunks, so the reviewer stops
     reporting existing helpers as undefined (see file_symbols). `file_contents` is the
     full, line-numbered text of changed files — for large-budget models only, so the
-    reviewer sees callers, error paths, and surrounding conventions. `max_chars` caps
-    the diff — larger on the high-TPM large-PR path."""
+    reviewer sees callers, error paths, and surrounding conventions. `prior_issues` is
+    the still-open issues from the previous review, so an incremental re-review can
+    confirm fixes instead of re-discovering them. `max_chars` caps the diff — larger
+    on the high-TPM large-PR path."""
     if conventions is None and _CONVENTIONS.exists():
         conventions = _CONVENTIONS.read_text(encoding="utf-8")
     parts = []
@@ -208,6 +211,13 @@ def build_prompt(
             "Full contents of the changed files at this PR's head, line-numbered. Use "
             "them to judge callers, error paths, and the conventions around each hunk — "
             "but only raise issues on lines the diff actually changed:\n" + file_contents
+        )
+    if prior_issues:
+        parts.append(
+            "Issues you flagged on the previous review that are still open. If the new "
+            "changes fix one, do NOT report it again; if it is still present, report it "
+            "at its current line. In your summary, say how many of these the new changes "
+            "addressed:\n" + prior_issues
         )
     parts.append("PR diff:\n" + truncate_diff(diff, max_chars))
     return "\n\n".join(parts)
@@ -302,6 +312,31 @@ def _unanchorable_md(issues) -> str:
     return "\n".join(lines)
 
 
+def _clean_prior_body(body: str) -> str:
+    """Strip the inline marker and a leading `**[severity]**` prefix from a stored
+    comment body, leaving just the human-readable issue text for the prompt."""
+    text = (body or "").split(f"<!-- {_INLINE_MARKER} -->")[0].strip()
+    if text.startswith("**[") and "]**" in text:
+        text = text.split("]**", 1)[1].strip()
+    return " ".join(text.split())  # collapse newlines/whitespace to one line
+
+
+def prior_issues_text(comments, scope) -> str:
+    """The still-open inline issues from the previous review, so an incremental
+    re-review confirms fixes instead of re-discovering them. Thread ROOTS only
+    (a reply is not an issue), filtered to files in `scope` (the delta's files —
+    the model never re-judged anything outside it, so its old threads must not
+    appear as 'still open')."""
+    lines = []
+    for c in comments:
+        if getattr(c, "in_reply_to_id", None) is not None:
+            continue
+        if c.path not in scope:
+            continue
+        lines.append(f"- {c.path}:{c.line} — {_clean_prior_body(c.body or '')}")
+    return "\n".join(lines)
+
+
 def run(repo, pr_number, diff):
     """Full /review, gated by head-SHA dedup + daily caps. Host-agnostic core."""
     pr = repo.get_pull(pr_number)
@@ -363,6 +398,16 @@ def run(repo, pr_number, diff):
     # Numbered BEFORE truncation so the prefixes always match the real file lines.
     numbered = number_diff(diff)
 
+    # On an incremental run, remind the model what it flagged last time so it confirms
+    # fixes instead of re-discovering (or silently dropping) them. Scoped to the delta's
+    # files — the model never re-judged anything outside them. set(anchors(diff)) is the
+    # delta's file set; uncapped, unlike changed_paths.
+    prior = ""
+    if incremental:
+        prior = prior_issues_text(
+            gh.get_inline_comments(repo, pr_number, _INLINE_MARKER), set(anchors(diff))
+        )
+
     def prompt_for(model: str) -> str:
         # Prompt sized per attempt: large-context models (NVIDIA) take the diff at
         # their own budget; the Groq/GitHub fallbacks keep the tier cap they were
@@ -376,7 +421,8 @@ def run(repo, pr_number, diff):
             budget = max(0, cap - min(len(numbered), cap))
             files_text = build_file_contents(changed_files, budget) or None
         return build_prompt(
-            numbered, conventions, cap, pr_text, project_context, outline, files_text
+            numbered, conventions, cap, pr_text, project_context, outline,
+            files_text, prior,
         )
 
     raw = complete(_SYSTEM, prompt_for, task, json_mode=True, used=used)
