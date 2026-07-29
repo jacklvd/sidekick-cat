@@ -29,7 +29,7 @@ from scripts.config import (
     REVIEW_SYMBOLS_PER_FILE,
 )
 from scripts.diff_anchors import anchors, block_path, file_blocks, number_diff, strip_noise
-from scripts.llm_client import complete, truncate_diff
+from scripts.llm_client import complete, failed, truncate_diff
 
 _INLINE_MARKER = "bot:review-inline"
 
@@ -383,11 +383,6 @@ def run(repo, pr_number, diff):
             f"🐱 Sidekick is taking a breather — {reason}. Try again later.",
         )
         return
-    # dev-note: recorded before the review runs (parity with the old check-and-record
-    # seen_sha): if the LLM call dies mid-flight this head isn't retried until a new
-    # commit moves the sha — rare, bounded by PR_DAILY_MAX, acceptable.
-    limits.record_reviewed_head(repo.full_name, pr_number, head_sha)
-
     # Incremental: a previously reviewed PR only gets its NEW commits re-read —
     # cheaper, usually fits the smart tier, and untouched files keep their threads.
     incremental = False
@@ -456,6 +451,19 @@ def run(repo, pr_number, diff):
         )
 
     raw = complete(_SYSTEM, prompt_for, task, json_mode=True, used=used)
+
+    # Record the head only once a model actually answered. complete() hands back a
+    # sentinel instead of raising (see llm_client.failed), so a quota/outage/oversize
+    # looks like a review by shape — and recording one would make the `prev == head_sha`
+    # return above permanent: that commit could never be reviewed again, not by /review,
+    # not by anything, because only a NEW sha clears it. A 15-minute breaker cooldown
+    # would silently strand every push it covered.
+    # dev-note: the old order recorded first, which also deduped two deliveries racing
+    # the same head. That race is now unguarded — cost is one duplicate review, and it's
+    # rare (delivery_seen drops webhook retries, and a push always moves the sha). A lost
+    # review is worse than a repeated one; revisit only if duplicates actually show up.
+    if not failed(raw):
+        limits.record_reviewed_head(repo.full_name, pr_number, head_sha)
 
     # Disclaimers built AFTER the call so the big-PR note names the model that
     # actually answered (falls back to the tier's primary if the call failed).

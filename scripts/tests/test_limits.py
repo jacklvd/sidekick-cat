@@ -22,6 +22,13 @@ def test_per_pr_cap_blocks_and_isolates():
     assert not blocked and "PR" in reason  # one over → blocked
     ok2, _ = limits.allow_llm_call("o/r", 2)  # a different PR is independent
     assert ok2
+    # Buckets are keyed by the interpolated pr, so a synthetic key gets its own
+    # allowance: reply_thread bills "<pr>:reply" and repo_context bills "context",
+    # which is what stops a chatty thread eating the reviews of the PR it discusses.
+    ok3, _ = limits.allow_llm_call("o/r", "1:reply")
+    assert ok3
+    ok4, _ = limits.allow_llm_call("o/r", "context")
+    assert ok4
 
 
 def test_reviewed_head():

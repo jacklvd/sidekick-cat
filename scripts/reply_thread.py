@@ -7,9 +7,9 @@ thread is anchored to, and the whole conversation so far — and answered in pla
 prose (not JSON) on the MODELS["reply"] tier.
 
 Only threads the bot started (root carries the bot:review-inline marker) get a reply;
-inference uses the LLM keys, posting uses GH_TOKEN. Gated by the same daily caps as
-/review — over cap it stays silent (a rate-limit note inside a code thread is noise,
-and the author can re-ask).
+inference uses the LLM keys, posting uses GH_TOKEN. Metered on its OWN per-PR bucket
+("<pr>:reply"), not the review budget — over cap it stays silent (a rate-limit note
+inside a code thread is noise, and the author can re-ask).
 
 Env: PR_NUMBER, ROOT_COMMENT_ID (main()); LLM keys + GH_TOKEN (see llm_client / gh).
 """
@@ -18,7 +18,7 @@ import logging
 import os
 
 from scripts import gh, limits
-from scripts.llm_client import complete
+from scripts.llm_client import complete, failed
 
 log = logging.getLogger("sidekick-cat.reply")
 
@@ -75,7 +75,11 @@ def run(repo, pr_number, reply_to_id) -> None:
     root, thread = gh.get_review_comment_thread(repo, pr_number, reply_to_id)
     if root is None or _INLINE_MARKER not in (root.body or ""):
         return  # not a thread we started — don't answer
-    ok, reason = limits.allow_llm_call(repo.full_name, pr_number)
+    # Replies bill to their own per-PR bucket: limits._checks interpolates the pr key, so
+    # a synthetic one gets an independent PR_DAILY_MAX (same trick as repo_context's
+    # "context"). Sharing the review bucket meant a conversation in the threads ate the
+    # reviews of the very PR being discussed — and the author has no way to see why.
+    ok, reason = limits.allow_llm_call(repo.full_name, f"{pr_number}:reply")
     if not ok:
         log.info("reply skipped, rate-limited: %s", reason)
         return
@@ -85,7 +89,7 @@ def run(repo, pr_number, reply_to_id) -> None:
     diff_hunk = getattr(root, "diff_hunk", "") or ""
     prompt = build_reply_prompt(conventions, file_text, root.path, diff_hunk, render_thread(thread))
     answer = complete(_SYSTEM, prompt, "reply")
-    if answer.strip().startswith("⚠️"):
+    if failed(answer):
         return  # quota/empty/outage — silence beats posting a broken reply
     gh.create_review_comment_reply(repo, pr_number, root.id, _reply_body(answer))
 

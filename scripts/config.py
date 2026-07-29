@@ -283,11 +283,26 @@ CONTEXT_HEAD_FILES = 12
 CONTEXT_HEAD_LINES = 40
 
 # --- cost safeguards. In-memory per instance, or shared via Firestore when
-# LIMITS_BACKEND=firestore. Defaults sit well under Groq's ~1000/day free cap,
-# so we stop ourselves long before the provider does. ---
-GLOBAL_DAILY_MAX = 400  # max LLM calls/day across everything
-REPO_DAILY_MAX = 100  # max LLM calls/day per repo
-PR_DAILY_MAX = 5  # max reviews+summaries/day per PR
+# LIMITS_BACKEND=firestore. ---
+# These are self-imposed, not provider-derived. The original 400/100/5 sat under Groq's
+# ~1000/day back when Groq was primary; NVIDIA leads every review tier now (see MODELS)
+# and is per-MODEL RPM-limited, not daily-metered. Measured live 2026-07-16: GLM 429s at
+# ~29 requests in 48s while Nemotron and Mistral answer 200 on the same key, and NVIDIA
+# returns no x-ratelimit-* headers, so a rung's budget can only be discovered by being
+# refused — which is exactly what the MODELS fallback chain already does. At real review
+# latency (~17s/call, --max-instances=3) the bot tops out near 10 RPM, so no provider
+# rate limit is reachable from here.
+# GLOBAL_DAILY_MAX is the one that still earns its keep: NVIDIA may meter a finite credit
+# pool and exposes neither a dashboard nor headers to check, so it backstops an unknown
+# ceiling. Per-repo/per-PR just stop one repo or one PR monopolizing that global budget.
+# dev-note: PR_DAILY_MAX governs each per-PR *bucket* independently, not the PR as a
+# whole — _checks interpolates the pr key, so "123", "123:reply" (reply_thread) and
+# "context" (repo_context) each get their own allowance. Deliberate: one constant, and a
+# chatty thread can't eat the reviews it's discussing. Split it only if one bucket needs
+# a genuinely different number.
+GLOBAL_DAILY_MAX = 400  # max LLM calls/day across everything — the real backstop
+REPO_DAILY_MAX = 300  # max LLM calls/day per repo
+PR_DAILY_MAX = 20  # max LLM calls/day per PR, per bucket (see dev-note above)
 BREAKER_FAILS = 5  # consecutive provider/API failures...
 BREAKER_WINDOW_S = 300  # ...within this window...
 BREAKER_COOLDOWN_S = 900  # ...opens the breaker for this long

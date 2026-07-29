@@ -1191,6 +1191,100 @@ def test_reply_thread_run_only_answers_bot_threads():
         limits._reset()
 
 
+def test_review_does_not_burn_the_head_when_no_model_answers():
+    # complete() returns a sentinel instead of raising, so a failed review is just a
+    # string. If run() recorded the head anyway, the `prev == head_sha` early-return
+    # would make that commit permanently un-reviewable: /review would silently do
+    # nothing forever and only a new push could clear it. A breaker cooldown would
+    # strand every push it covered.
+    import scripts.review_pr as rp
+    from scripts import limits
+    from scripts.llm_client import _QUOTA_MSG
+
+    posted, modeled = [], []
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h0"}), "title": "t", "body": ""})()
+
+    orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+            rp.repo_context.ensure_fresh)
+    rp.gh.upsert_comment = lambda repo, n, marker, body: posted.append(marker)
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
+    rp.reconcile_inline = lambda *a, **k: None
+    rp.repo_context.ensure_fresh = lambda repo: ""
+    try:
+        limits._reset()
+        # every rung is down -> complete() hands back the sentinel
+        rp.complete = lambda s, u, t, **kw: (modeled.append(1), _QUOTA_MSG)[1]
+        rp.run(FakeRepo(), 1, "a diff")
+        assert posted == ["bot:review"]  # the ⚠️ still reaches the author
+        assert limits.reviewed_head("o/r", 1) is None  # ...but the head stays retryable
+
+        # provider recovers -> the SAME head still gets its review, no re-push needed
+        rp.complete = lambda s, u, t, **kw: (
+            modeled.append(1), '{"verdict":"approve","summary":"ok","issues":[]}')[1]
+        rp.run(FakeRepo(), 1, "a diff")
+        assert len(modeled) == 2 and limits.reviewed_head("o/r", 1) == "h0"
+
+        rp.run(FakeRepo(), 1, "a diff")  # now recorded -> re-review is free
+        assert len(modeled) == 2
+    finally:
+        (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+         rp.repo_context.ensure_fresh) = orig
+        limits._reset()
+
+
+def test_reply_thread_bills_its_own_bucket():
+    # A conversation in the threads must not spend the reviews of the PR it is about:
+    # reply_thread bills a synthetic "<pr>:reply" key, so an exhausted review budget
+    # still leaves the author an answer. Reverting that key makes this test fail.
+    import scripts.reply_thread as rt
+    from scripts import limits
+    from scripts.config import PR_DAILY_MAX
+
+    posted = []
+
+    class C:
+        def __init__(self, body, path="a.py", id=99):
+            self.body, self.path, self.diff_hunk, self.id = body, path, "@@", id
+            self.user = type("U", (), {"login": "dev"})()
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h"})})()
+
+    root = C("**[major]** bug\n<!-- bot:review-inline -->", id=99)
+    orig = (rt.gh.get_review_comment_thread, rt.gh.get_file_text,
+            rt.gh.create_review_comment_reply, rt.complete)
+    rt.gh.get_review_comment_thread = lambda repo, n, rid: (root, [root, C("why?", id=100)])
+    rt.gh.get_file_text = lambda repo, path, ref=None: "rules"
+    rt.gh.create_review_comment_reply = lambda repo, n, rid, body: posted.append(rid)
+    rt.complete = lambda s, u, t: "Here's why."
+    try:
+        limits._reset()
+        for _ in range(PR_DAILY_MAX):  # spend PR 1's REVIEW budget dry
+            assert limits.allow_llm_call("o/r", 1)[0]
+        assert not limits.allow_llm_call("o/r", 1)[0]  # reviews are capped...
+        rt.run(FakeRepo(), 1, 5)
+        assert posted == [99]  # ...but the thread still gets its answer
+
+        # the reply bucket is finite too — spend the rest of it, then silence.
+        for _ in range(PR_DAILY_MAX - 1):  # run() already spent 1
+            limits.allow_llm_call("o/r", "1:reply")
+        posted.clear()
+        rt.run(FakeRepo(), 1, 5)
+        assert posted == []
+    finally:
+        (rt.gh.get_review_comment_thread, rt.gh.get_file_text,
+         rt.gh.create_review_comment_reply, rt.complete) = orig
+        limits._reset()
+
+
 def test_classify_thread_reply():
     from server.router import classify
 
@@ -1346,4 +1440,6 @@ if __name__ == "__main__":
     test_get_review_comment_thread_resolves_root_from_any_comment()
     test_reply_thread_prompt_pieces()
     test_reply_thread_run_only_answers_bot_threads()
+    test_reply_thread_bills_its_own_bucket()
+    test_review_does_not_burn_the_head_when_no_model_answers()
     print("ok")

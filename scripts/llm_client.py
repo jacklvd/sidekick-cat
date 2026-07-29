@@ -35,6 +35,21 @@ _TOO_LARGE_MSG = (
     "⚠️ This PR is too large for the model's request cap — the diff was truncated "
     "and still didn't fit. Review skipped for now."
 )
+_SENTINELS = frozenset({_QUOTA_MSG, _EMPTY_MSG, _TOO_LARGE_MSG})
+
+
+def failed(text: str) -> bool:
+    """True when `text` is one of complete()'s sentinels rather than a model's answer.
+
+    complete() never raises — a quota, an outage, an empty body, or an oversized prompt
+    all come back as a friendly string — so by shape alone a caller cannot tell a failure
+    from an answer. This is the seam that says "no model answered", and callers must not
+    treat a sentinel as content: don't record it as reviewed, don't post it in a thread.
+
+    Exact match, not a "⚠️" prefix test: a model may legitimately open a reply or a review
+    with a warning sign, and dropping that would silently lose real content.
+    """
+    return text.strip() in _SENTINELS
 
 # provider -> (base_url, env var holding its API key)
 _PROVIDERS = {
