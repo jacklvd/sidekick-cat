@@ -23,6 +23,7 @@ from scripts.config import (
     MAX_DIFF_CHARS,
     MODEL_INPUT_CHARS,
     MODELS,
+    REVIEW_FILE_MAX_CHARS,
     REVIEW_LARGE_DIFF_CHARS,
     REVIEW_SYMBOL_FILES,
     REVIEW_SYMBOLS_PER_FILE,
@@ -141,6 +142,31 @@ def build_symbol_outline(files: dict[str, str]) -> str:
     return "\n".join(parts)
 
 
+def build_file_contents(
+    files: dict[str, str], max_chars: int, per_file_max: int = REVIEW_FILE_MAX_CHARS
+) -> str:
+    """Full, line-numbered text of the changed files, in diff order — what the symbol
+    outline can only name. For large-context models only (see run.prompt_for): the
+    reviewer sees callers, error paths, and surrounding conventions, not just the hunk.
+
+    Files that don't fit are dropped whole, never sliced: a half-file is worse than an
+    absent one (the reviewer reads a cut-off body as a defect). A file over per_file_max
+    is skipped outright — it's almost certainly generated. Returns "" when nothing fits."""
+    parts, size = [], 0
+    for path, text in files.items():
+        if not text or len(text) > per_file_max:
+            continue
+        numbered = "\n".join(
+            f"{i}| {line}" for i, line in enumerate(text.splitlines(), 1)
+        )
+        block = f"{path}:\n{numbered}"
+        if size + len(block) > max_chars:
+            break
+        parts.append(block)
+        size += len(block)
+    return "\n\n".join(parts)
+
+
 def build_prompt(
     diff: str,
     conventions: str | None = None,
@@ -148,6 +174,7 @@ def build_prompt(
     pr_text: str | None = None,
     project_context: str | None = None,
     symbol_outline: str | None = None,
+    file_contents: str | None = None,
 ) -> str:
     """Compose the review prompt. `conventions` is the target repo's CLAUDE.md text
     (Cloud Run fetches it via API); when None, fall back to a local file (Actions).
@@ -156,7 +183,9 @@ def build_prompt(
     vacuum. `pr_text` is the PR title+body — what the change CLAIMS to do, so the
     reviewer can flag code that contradicts its own description. `symbol_outline` is
     what each changed file *already* defines outside the hunks, so the reviewer stops
-    reporting existing helpers as undefined (see file_symbols). `max_chars` caps
+    reporting existing helpers as undefined (see file_symbols). `file_contents` is the
+    full, line-numbered text of changed files — for large-budget models only, so the
+    reviewer sees callers, error paths, and surrounding conventions. `max_chars` caps
     the diff — larger on the high-TPM large-PR path."""
     if conventions is None and _CONVENTIONS.exists():
         conventions = _CONVENTIONS.read_text(encoding="utf-8")
@@ -173,6 +202,12 @@ def build_prompt(
             "this PR's head). The diff shows you only the changed lines, so a helper "
             "listed here EXISTS even when you cannot see its definition — do not report "
             "it as missing, undefined, or unimported:\n" + symbol_outline
+        )
+    if file_contents:
+        parts.append(
+            "Full contents of the changed files at this PR's head, line-numbered. Use "
+            "them to judge callers, error paths, and the conventions around each hunk — "
+            "but only raise issues on lines the diff actually changed:\n" + file_contents
         )
     parts.append("PR diff:\n" + truncate_diff(diff, max_chars))
     return "\n\n".join(parts)
@@ -315,13 +350,15 @@ def run(repo, pr_number, diff):
     # What the changed files already define outside the hunks. Read at head_sha, not the
     # default branch: a helper this PR itself adds doesn't exist on the default branch, and
     # reporting it missing is the very mistake the outline exists to prevent.
-    outline = build_symbol_outline(
-        {
-            path: text
-            for path in changed_paths(diff)
-            if (text := gh.get_file_text(repo, path, ref=head_sha))
-        }
-    )
+    # Fetched once at head_sha: the outline names these files' symbols, and (for
+    # large-budget models) prompt_for folds in their full bodies. Same API calls,
+    # the text is no longer thrown away.
+    changed_files = {
+        path: text
+        for path in changed_paths(diff)
+        if (text := gh.get_file_text(repo, path, ref=head_sha))
+    }
+    outline = build_symbol_outline(changed_files)
     used: list = []  # complete() appends the (provider, model) that answered
     # Numbered BEFORE truncation so the prefixes always match the real file lines.
     numbered = number_diff(diff)
@@ -331,7 +368,16 @@ def run(repo, pr_number, diff):
         # their own budget; the Groq/GitHub fallbacks keep the tier cap they were
         # TPM-tuned for. Same diff, different truncation point.
         cap = MODEL_INPUT_CHARS.get(model, max_chars)
-        return build_prompt(numbered, conventions, cap, pr_text, project_context, outline)
+        # Full changed-file bodies only for large-budget rungs, and only in whatever
+        # cap the diff leaves free — a monster diff fills the budget and the outline
+        # still carries the cross-file signal. Small rungs never get bodies (no room).
+        files_text = None
+        if model in MODEL_INPUT_CHARS:
+            budget = max(0, cap - min(len(numbered), cap))
+            files_text = build_file_contents(changed_files, budget) or None
+        return build_prompt(
+            numbered, conventions, cap, pr_text, project_context, outline, files_text
+        )
 
     raw = complete(_SYSTEM, prompt_for, task, json_mode=True, used=used)
 

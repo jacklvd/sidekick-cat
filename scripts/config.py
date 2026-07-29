@@ -180,6 +180,14 @@ PROVIDER_MAX_TOKENS = {"nvidia": 8000, "groq": 4000}
 REVIEW_SYMBOL_FILES = 12
 REVIEW_SYMBOLS_PER_FILE = 60
 
+# Full changed-file contents folded into the review prompt for large-budget models
+# (see review_pr.build_file_contents / run). The symbol outline gives names only; the
+# large-context NVIDIA rungs can take the real bodies, so the reviewer sees callers,
+# error paths, and the conventions around each hunk — not just the changed lines. A
+# single file larger than this is skipped (almost always generated/minified — the
+# NOISE_GLOBS strip catches most, this catches the rest without a second glob pass).
+REVIEW_FILE_MAX_CHARS = 24000
+
 # Deterministic PR-open.
 # Sections the PR description must contain (matched as line-leading headings,
 # case-insensitive). "TL;DR" (no trailing colon) so both "## TL;DR" and

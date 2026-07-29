@@ -557,6 +557,45 @@ def test_run_feeds_project_context_to_model():
         limits._reset()
 
 
+def test_run_feeds_file_contents_to_large_budget_models_only():
+    import scripts.review_pr as rp
+    from scripts import limits
+    from scripts.config import NVIDIA_GLM
+
+    prompts_by_model = {}
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h"}), "title": "t", "body": ""})()
+
+    # `u` is the per-model prompt builder; call it for a large-budget model and a small one.
+    def fake_complete(s, u, t, **kw):
+        prompts_by_model["large"] = u(NVIDIA_GLM)
+        prompts_by_model["small"] = u("groq/whatever-small")
+        return '{"verdict":"comment","summary":"ok","issues":[]}'
+
+    diff = _block("mod.py", "+x = 1\n")
+    orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+            rp.repo_context.ensure_fresh)
+    rp.complete = fake_complete
+    rp.gh.upsert_comment = lambda repo, n, marker, body: None
+    # get_file_text feeds both CLAUDE.md and the changed-file bodies; return a distinctive body.
+    rp.gh.get_file_text = lambda repo, path, ref=None: "SENTINEL_BODY = 42\n" if path == "mod.py" else ""
+    rp.reconcile_inline = lambda *a, **k: None
+    rp.repo_context.ensure_fresh = lambda repo: ""
+    try:
+        limits._reset()
+        rp.run(FakeRepo(), 1, diff)
+        assert "SENTINEL_BODY = 42" in prompts_by_model["large"]  # NVIDIA sees the file body
+        assert "SENTINEL_BODY = 42" not in prompts_by_model["small"]  # small rung does not
+    finally:
+        (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+         rp.repo_context.ensure_fresh) = orig
+        limits._reset()
+
+
 def test_react_wiring():
     # react() must reach the comment via Issue.get_comment (Repository has no
     # get_issue_comment in PyGithub — the old path raised AttributeError on every
@@ -911,6 +950,44 @@ def test_merge_gating():
         mp.gh.graphql, mp.gh.upsert_comment = orig
 
 
+def test_build_file_contents_numbers_and_bounds():
+    from scripts.review_pr import build_file_contents
+
+    files = {"a.py": "import os\n\n\ndef f():\n    return 1\n", "b.py": "x = 2\n"}
+    out = build_file_contents(files, max_chars=10000)
+    assert "a.py:" in out and "b.py:" in out
+    assert "1| import os" in out            # line-numbered from 1
+    assert "4| def f():" in out             # numbers track real file lines
+    assert out.index("a.py:") < out.index("b.py:")  # diff order preserved
+
+    # a single oversized file is skipped (likely generated), the rest still render
+    big = {"huge.py": "z\n" * 5000, "small.py": "ok\n"}
+    out2 = build_file_contents(big, max_chars=100000, per_file_max=100)
+    assert "huge.py" not in out2 and "1| ok" in out2
+
+    # budget stops the list at whole-file granularity — never a half file. Size the
+    # budget to exactly one whole a.py block (measured via a single-file render) so
+    # a.py fits and b.py doesn't.
+    a_block = build_file_contents({"a.py": files["a.py"]}, max_chars=100000)
+    out3 = build_file_contents(files, max_chars=len(a_block))
+    assert "a.py:" in out3 and "b.py:" not in out3
+
+    # a budget too small for even the first file yields nothing — never an over-budget file
+    assert build_file_contents(files, max_chars=1) == ""
+    assert build_file_contents(files, max_chars=0) == ""
+    assert build_file_contents({}, max_chars=1000) == ""
+
+
+def test_build_prompt_includes_file_contents():
+    from scripts.review_pr import build_prompt
+
+    p = build_prompt("DIFF", conventions="rules", file_contents="a.py:\n1| x = 1")
+    assert "1| x = 1" in p
+    assert p.index("1| x = 1") < p.index("DIFF")  # full files before the diff
+    assert "only raise issues on lines the diff" in p  # the scoping instruction
+    assert "1| x = 1" not in build_prompt("DIFF", conventions="rules")  # optional
+
+
 if __name__ == "__main__":
     test_missing_sections()
     test_labels_for()
@@ -932,12 +1009,15 @@ if __name__ == "__main__":
     test_strip_noise()
     test_truncate_diff_per_file()
     test_complete_json_mode()
+    test_build_file_contents_numbers_and_bounds()
+    test_build_prompt_includes_file_contents()
     test_build_prompt_includes_pr_text()
     test_build_prompt_includes_project_context()
     test_file_symbols_finds_helpers_defined_outside_the_diff()
     test_symbol_outline_lands_in_the_prompt_before_the_diff()
     test_run_feeds_pr_text_to_model()
     test_run_feeds_project_context_to_model()
+    test_run_feeds_file_contents_to_large_budget_models_only()
     test_react_wiring()
     test_get_tree()
     test_context_issue_upsert()
