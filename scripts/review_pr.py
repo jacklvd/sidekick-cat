@@ -12,6 +12,7 @@ GH_TOKEN. PR number = the triggering comment's issue.
 """
 
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -20,6 +21,8 @@ from scripts import gh, limits, repo_context
 from scripts.config import (
     AUTO_APPROVE,
     CONTEXT_MAX_TREE_CHARS,
+    ICON,
+    ICON_HMM,
     MAX_DIFF_CHARS,
     MODEL_INPUT_CHARS,
     MODELS,
@@ -31,12 +34,14 @@ from scripts.config import (
 from scripts.diff_anchors import anchors, block_path, file_blocks, number_diff, strip_noise
 from scripts.llm_client import complete, failed, truncate_diff
 
+log = logging.getLogger("sidekick-cat")  # shares the server's log stream
+
 _INLINE_MARKER = "bot:review-inline"
 
 # Note appended to a stale thread root that has replies (see _resolved_note): we edit
 # rather than delete so the human's reply isn't orphaned. prior_issues_text keys on this
 # to stop re-feeding an already-resolved root as a "still-open" issue.
-_RESOLVED_NOTE = "_🐱 The latest review no longer flags this._"
+_RESOLVED_NOTE = f"_{ICON} The latest review no longer flags this._"
 
 # Friendly display names for review models — config's ids are ugly for user copy.
 _MODEL_LABELS = {
@@ -58,7 +63,7 @@ def _large_note(model: str) -> str:
     Falls back to the tier's primary label when the responder is unknown."""
     label = _MODEL_LABELS.get(model, model)
     return (
-        f"> 🐱 Big PR — I reviewed the whole diff in one pass with **{label}**. "
+        f"> {ICON} Big PR — I reviewed the whole diff in one pass with **{label}**. "
         "Treat it as a wide first sweep; split the PR and `/review` again for a "
         "closer look.\n\n"
     )
@@ -423,7 +428,7 @@ def run(repo, pr_number, diff, token=None):
             repo,
             pr_number,
             "bot:ratelimit",
-            f"🐱 Sidekick is taking a breather — {reason}. Try again later.",
+            f"{ICON_HMM} Sidekick is taking a breather — {reason}. Try again later.",
         )
         return "failed"  # no review ran — the check goes neutral, not a false verdict
     # Size-route: small PRs go to the smart tier; big diffs to the high-TPM tier so
@@ -479,7 +484,13 @@ def run(repo, pr_number, diff, token=None):
             files_text, prior,
         )
 
-    raw = complete(_SYSTEM, prompt_for, task, json_mode=True, used=used)
+    raw = complete(_SYSTEM, prompt_for, task, json_mode=True, used=used,
+                   rotate_key=hash((repo.full_name, pr_number)))
+    # Which rung actually answered — so a silent slide onto the fallbacks (NVIDIA quietly
+    # failing) shows up in the logs instead of only in slower/worse reviews.
+    log.info("review repo=%s pr=%s task=%s responder=%s",
+             repo.full_name, pr_number, task,
+             "/".join(used[0]) if used else "none")
 
     # Record the head only once a model actually answered. complete() hands back a
     # sentinel instead of raising (see llm_client.failed), so a quota/outage/oversize
@@ -499,7 +510,7 @@ def run(repo, pr_number, diff, token=None):
     note = _large_note(used[0][1] if used else MODELS[task][0][1]) if large else ""
     if incremental:
         note = (
-            f"> 🐱 Incremental review — only the changes since `{prev[:7]}`; "
+            f"> {ICON} Incremental review — only the changes since `{prev[:7]}`; "
             "earlier threads on untouched files were left as-is.\n\n"
         ) + note
 
@@ -508,7 +519,7 @@ def run(repo, pr_number, diff, token=None):
         # Fallback: model didn't return parseable JSON (quota msg, malformed) —
         # post whatever it said as the summary, no inline comments (summary-only fallback).
         gh.upsert_comment(
-            repo, pr_number, "bot:review", "### 🐱 Sidekick's code review\n" + note + raw
+            repo, pr_number, "bot:review", f"### {ICON} Sidekick's code review\n" + note + raw
         )
         return "failed" if failed(raw) else "done"
 
@@ -523,7 +534,7 @@ def run(repo, pr_number, diff, token=None):
     )
 
     summary = (
-        "### 🐱 Sidekick's code review\n"
+        f"### {ICON} Sidekick's code review\n"
         + note
         + f"VERDICT: {verdict}\n\n"
         + str(data.get("summary", "")).strip()

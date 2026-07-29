@@ -133,7 +133,33 @@ def _call(provider: str, system: str, user: str, model: str, json_mode: bool = F
     return _content(resp)
 
 
-def complete(system: str, user, task: str, json_mode: bool = False, used: list | None = None) -> str:
+def _rotate_head(rungs: list, key: int | None) -> list:
+    """Pin the first rung (GLM-5.2 — the best reviewer here) and round-robin only the
+    same-provider siblings *behind* it by `key` — a stateless, per-PR round-robin.
+
+    GLM leads every review; when it 429s, `key` (a PR-identity hash) spreads which NVIDIA
+    sibling is tried second, so concurrent fallbacks don't all pile onto the same rung. The
+    head model itself never rotates out of first place. Only the interchangeable NVIDIA
+    block rotates: the cross-provider tail (Groq/GitHub) is ordered by how big a request each
+    will accept (see config), and reordering it would send a diff to a rung that 413s. `key`
+    being any int is enough — its spread across PRs is all this needs, so a per-process hash
+    seed is fine; cross-process determinism is not required.
+    """
+    if key is None:
+        return rungs
+    lead = rungs[0][0]
+    n = 0
+    while n < len(rungs) and rungs[n][0] == lead:
+        n += 1
+    if n <= 2:
+        return rungs  # GLM + at most one sibling — nothing to spread behind the pinned head
+    tail = rungs[1:n]
+    off = key % len(tail)
+    return [rungs[0]] + tail[off:] + tail[:off] + rungs[n:]
+
+
+def complete(system: str, user, task: str, json_mode: bool = False, used: list | None = None,
+             rotate_key: int | None = None) -> str:
     """Try primary then fallback. `task` is a key into config.MODELS ('summary'|'review').
 
     `user` is the prompt (str), or a callable `(model_id) -> str` invoked per attempt
@@ -141,13 +167,15 @@ def complete(system: str, user, task: str, json_mode: bool = False, used: list |
     Returns a friendly message (never raises) so a quota/outage degrades gracefully.
     If `used` is given, the (provider, model) that actually answered is appended to
     it — lets a caller name the responder (e.g. the big-PR note) instead of guessing.
+    `rotate_key` (a PR-identity hash) spreads which head model is tried first — see
+    _rotate_head; omitted, the chain runs in its declared order.
     """
     if limits.breaker_open():
         return _QUOTA_MSG  # a provider/API is failing → don't hammer it
     too_large = False
     empty = False  # some rung answered with nothing (see _content)
     dead: set[str] = set()  # providers to skip for the rest of this call
-    for provider, model in MODELS[task]:
+    for provider, model in _rotate_head(MODELS[task], rotate_key):
         if provider in dead:
             continue  # host unreachable or key absent — don't retry its later models
         try:

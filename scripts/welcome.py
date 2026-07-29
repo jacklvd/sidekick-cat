@@ -4,13 +4,14 @@ import os
 from pathlib import Path
 
 from scripts import gh
+from scripts.config import ICON
 
 TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "welcome.md"
 
 
 def run(repo, pr_number, author):
     """Post the welcome comment and assign the opener. Host-agnostic core."""
-    body = TEMPLATE.read_text(encoding="utf-8").format(author=author)
+    body = TEMPLATE.read_text(encoding="utf-8").format(author=author, icon=ICON)
     gh.upsert_comment(repo, pr_number, "bot:welcome", body)
     gh.assign(repo, pr_number, author)  # auto-assign the PR opener
 

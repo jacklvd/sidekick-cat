@@ -22,6 +22,7 @@ import os
 from fastapi import BackgroundTasks, FastAPI, Request, Response
 
 from scripts import check_run, gh, label_pr, merge_pr, repo_context, reply_thread, review_pr, validate_pr, welcome
+from scripts.config import ICON, ICON_HMM
 from scripts.gh import get_pr_diff, repo_from_token
 from scripts.limits import delivery_seen
 from server.gh_app_auth import installation_token
@@ -85,8 +86,8 @@ def dispatch(intent: dict) -> None:
             gh.react(repo, number, intent["comment_id"])  # 👀 immediate ack on the comment
             body = repo_context.run(repo)
             msg = (
-                "🐱 Project context refreshed." if body
-                else "🐱 Sidekick is taking a breather — try `/context` again later."
+                f"{ICON} Project context refreshed." if body
+                else f"{ICON_HMM} Sidekick is taking a breather — try `/context` again later."
             )
             gh.upsert_comment(repo, number, "bot:context-ack", msg)
         elif kind == "thread_reply":

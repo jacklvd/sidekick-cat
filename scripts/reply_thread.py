@@ -18,6 +18,7 @@ import logging
 import os
 
 from scripts import gh, limits
+from scripts.config import ICON
 from scripts.llm_client import complete, failed
 
 log = logging.getLogger("sidekick-cat.reply")
@@ -62,7 +63,7 @@ def _numbered(text: str) -> str:
 
 
 def _reply_body(answer: str) -> str:
-    return f"🐱 {answer.strip()}\n<!-- {_REPLY_MARKER} -->"
+    return f"{ICON} {answer.strip()}\n<!-- {_REPLY_MARKER} -->"
 
 
 def run(repo, pr_number, reply_to_id) -> None:

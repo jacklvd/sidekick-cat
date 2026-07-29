@@ -409,6 +409,30 @@ def test_complete_json_mode():
         limits._reset()
 
 
+def test_rotate_head():
+    from scripts.llm_client import _rotate_head
+
+    chain = [("nvidia", "a"), ("nvidia", "b"), ("nvidia", "c"),
+             ("groq", "g"), ("github", "h")]
+    # No key -> untouched.
+    assert _rotate_head(chain, None) == chain
+    # The head (GLM, here "a") is pinned first for every key; only the siblings behind it
+    # round-robin. The ordered cross-provider tail stays put.
+    assert _rotate_head(chain, 1) == [("nvidia", "a"), ("nvidia", "c"), ("nvidia", "b"),
+                                      ("groq", "g"), ("github", "h")]
+    for k in range(7):
+        out = _rotate_head(chain, k)
+        assert out[0] == chain[0]           # head never rotates out of first place
+        assert out[3:] == chain[3:]         # tail preserved
+        tail, o = chain[1:3], k % 2
+        assert out[1:3] == tail[o:] + tail[:o]
+    # GLM + a single sibling — nothing to spread behind the pinned head, returned as-is.
+    assert _rotate_head([("nvidia", "x"), ("nvidia", "y"), ("groq", "z")], 5) == \
+        [("nvidia", "x"), ("nvidia", "y"), ("groq", "z")]
+    # Single-model head (summary/context/reply) — nothing to spread, returned as-is.
+    assert _rotate_head([("nvidia", "x"), ("groq", "y")], 5) == [("nvidia", "x"), ("groq", "y")]
+
+
 def test_build_prompt_includes_pr_text():
     from scripts.review_pr import build_prompt
 
@@ -781,7 +805,7 @@ def test_reconcile_unresolves_on_recurrence_and_degrades_safe():
 
     # (2) idempotent: a stale root already resolved + noted -> no re-resolve, no edit.
     noted = _RC(2, "b.py", 2,
-                "x\n\n_🐱 The latest review no longer flags this._\n<!-- bot:review-inline -->")
+                f"x\n\n{rp._RESOLVED_NOTE}\n<!-- bot:review-inline -->")
     edited, resolved, unresolved, restore = _reconcile_fakes(rp, [noted], {2: ("T2", True)})
     try:
         rp.reconcile_inline(None, 1, "sha", [], "tok")
@@ -1216,7 +1240,7 @@ def test_reply_thread_run_only_answers_bot_threads():
         rt.gh.get_review_comment_thread = lambda repo, n, rid: (root, [root, C("why?", id=100)])
         rt.run(FakeRepo(), 1, 5)
         assert len(posted) == 1 and posted[0][0] == 99  # posted to the root, not the webhook id
-        assert "🐱" in posted[0][1] and "bot:review-reply" in posted[0][1]
+        assert rt.ICON in posted[0][1] and "bot:review-reply" in posted[0][1]
 
         # a failed completion (⚠️) -> silence
         posted.clear()

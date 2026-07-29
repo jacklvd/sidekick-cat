@@ -195,6 +195,16 @@ REVIEW_SYMBOLS_PER_FILE = 60
 # NOISE_GLOBS strip catches most, this catches the rest without a second glob pass).
 REVIEW_FILE_MAX_CHARS = 24000
 
+# Sidekick's face, in two moods: ICON (neutral/positive) and ICON_HMM (blockers,
+# errors, waiting). Emoji, not images, so it renders identically on every surface —
+# comment bodies, check-run titles (check_run.py) and Issue titles (repo_context.py),
+# the last two being plain text where an <img> would show as literal markup.
+# dev-note: swap these for `<img src=... width="18" align="top">` tags to use a real
+# avatar; the image must be hosted somewhere public or GitHub's anonymous image proxy
+# 404s it. Everything downstream interpolates these two names, so nothing else changes.
+ICON = "🐱"
+ICON_HMM = "🐱"
+
 # Deterministic PR-open.
 # Sections the PR description must contain (matched as line-leading headings,
 # case-insensitive). "TL;DR" (no trailing colon) so both "## TL;DR" and
