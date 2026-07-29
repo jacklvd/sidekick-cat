@@ -374,15 +374,7 @@ def run(repo, pr_number, diff):
     prev = limits.reviewed_head(repo.full_name, pr_number)
     if prev == head_sha:
         return  # unchanged head already reviewed — re-review is free + idempotent
-    ok, reason = limits.allow_llm_call(repo.full_name, pr_number)
-    if not ok:
-        gh.upsert_comment(
-            repo,
-            pr_number,
-            "bot:ratelimit",
-            f"🐱 Sidekick is taking a breather — {reason}. Try again later.",
-        )
-        return
+
     # Incremental: a previously reviewed PR only gets its NEW commits re-read —
     # cheaper, usually fits the smart tier, and untouched files keep their threads.
     incremental = False
@@ -397,6 +389,25 @@ def run(repo, pr_number, diff):
     # Strip generated/vendored files BEFORE size-routing: a lock-file bump must not
     # push an otherwise small PR onto the broad-sweep large-model path.
     diff = strip_noise(diff)
+    if not diff.strip():
+        # Nothing reviewable survived — a lockfile/vendored-only push. Record the head
+        # so the next push compares from here, and stay silent: "nothing to review" on
+        # every dependency bump is noise the author never asked for.
+        limits.record_reviewed_head(repo.full_name, pr_number, head_sha)
+        return
+
+    # Gate immediately before the model call. This is a cap on *LLM calls*, so the two
+    # GitHub reads above — which may legitimately find nothing to review — must not
+    # spend it. Auto-review makes that common: every dependency bump hits this path.
+    ok, reason = limits.allow_llm_call(repo.full_name, pr_number)
+    if not ok:
+        gh.upsert_comment(
+            repo,
+            pr_number,
+            "bot:ratelimit",
+            f"🐱 Sidekick is taking a breather — {reason}. Try again later.",
+        )
+        return
     # Size-route: small PRs go to the smart tier; big diffs to the high-TPM tier so
     # the whole thing fits one pass (and the large path may send a bigger diff). The
     # threshold is the small model's truncation cap — over it, qwen would truncate.

@@ -129,32 +129,6 @@ def test_summarize_empty():
     assert "No diff" in summarize("   \n  ")
 
 
-def test_summarize_gating():
-    # C5: run() must meter LLM calls — within budget posts a summary, over the
-    # per-PR cap posts the ratelimit note and never touches the model.
-    import scripts.summarize_pr as sp
-    from scripts import limits
-    from scripts.config import PR_DAILY_MAX
-
-    limits._reset()
-    posted, modeled = [], []
-    orig_up, orig_sum = sp.gh.upsert_comment, sp.summarize
-    sp.gh.upsert_comment = lambda repo, n, marker, body: posted.append(marker)
-    sp.summarize = lambda diff: (modeled.append(1), "MODEL")[1]
-
-    class FakeRepo:
-        full_name = "o/r"
-
-    try:
-        for _ in range(PR_DAILY_MAX):  # spend the per-PR budget
-            sp.run(FakeRepo(), 1, "a diff")
-        assert posted == ["bot:summary"] * PR_DAILY_MAX
-        assert len(modeled) == PR_DAILY_MAX
-        sp.run(FakeRepo(), 1, "a diff")  # one over → capped
-        assert posted[-1] == "bot:ratelimit"
-        assert len(modeled) == PR_DAILY_MAX  # model NOT called when capped
-    finally:
-        sp.gh.upsert_comment, sp.summarize = orig_up, orig_sum
 
 
 def test_review_gating():
@@ -1191,6 +1165,50 @@ def test_reply_thread_run_only_answers_bot_threads():
         limits._reset()
 
 
+def test_review_skips_when_the_noise_strip_leaves_nothing():
+    # A lockfile-only push: strip_noise eats the whole diff. Reviewing what's left would
+    # ask a model to review nothing AND spend a budget unit doing it. Silence, not a
+    # comment: "nothing to review" on every dependency bump is noise. The head is still
+    # recorded so the next push compares from here.
+    import scripts.review_pr as rp
+    from scripts import limits
+    from scripts.config import PR_DAILY_MAX
+
+    modeled, posted = [], []
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h0"}), "title": "t", "body": ""})()
+
+    orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+            rp.repo_context.ensure_fresh)
+    rp.complete = lambda s, u, t, **kw: (modeled.append(1), '{"verdict":"approve","summary":"ok","issues":[]}')[1]
+    rp.gh.upsert_comment = lambda repo, n, marker, body: posted.append(marker)
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
+    rp.reconcile_inline = lambda *a, **k: None
+    rp.repo_context.ensure_fresh = lambda repo: ""
+    try:
+        limits._reset()
+        rp.run(FakeRepo(), 1, _block("uv.lock") + _block("package-lock.json"))
+        assert modeled == []                            # no model call
+        assert posted == []                             # and no comment
+        assert limits.reviewed_head("o/r", 1) == "h0"   # head recorded: next push compares from here
+        # The budget is untouched — the whole point of stripping before the cap check.
+        for _ in range(PR_DAILY_MAX):
+            assert limits.allow_llm_call("o/r", 1)[0]
+
+        # Sanity: a diff with real code in it still reviews normally.
+        limits._reset()
+        rp.run(FakeRepo(), 1, _block("app.py") + _block("uv.lock"))
+        assert modeled == [1] and posted == ["bot:review"]
+    finally:
+        (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+         rp.repo_context.ensure_fresh) = orig
+        limits._reset()
+
+
 def test_review_does_not_burn_the_head_when_no_model_answers():
     # complete() returns a sentinel instead of raising, so a failed review is just a
     # string. If run() recorded the head anyway, the `prev == head_sha` early-return
@@ -1396,7 +1414,6 @@ if __name__ == "__main__":
     test_desired_labels_prefers_the_title_over_the_diff()
     test_desired_labels_falls_back_to_branch_then_triage()
     test_summarize_empty()
-    test_summarize_gating()
     test_review_gating()
     test_review_routes_by_size()
     test_render_tree()
@@ -1441,5 +1458,6 @@ if __name__ == "__main__":
     test_reply_thread_prompt_pieces()
     test_reply_thread_run_only_answers_bot_threads()
     test_reply_thread_bills_its_own_bucket()
+    test_review_skips_when_the_noise_strip_leaves_nothing()
     test_review_does_not_burn_the_head_when_no_model_answers()
     print("ok")
