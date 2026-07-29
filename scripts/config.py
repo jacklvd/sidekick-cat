@@ -101,6 +101,13 @@ MODELS = {
         ("github", REVIEW_MODEL),
         ("groq", "openai/gpt-oss-120b"),
     ],
+    # Conversational reply in a review thread (plain prose, not JSON) — GLM leads for quality,
+    # a cheap Groq backstop so a reply still lands if NIM is down.
+    "reply": [
+        ("nvidia", NVIDIA_GLM),
+        ("nvidia", NVIDIA_NEMOTRON),
+        ("groq", "llama-3.1-8b-instant"),
+    ],
 }
 
 # Cap diff size before sending so big PRs don't blow the free-tier token budget.

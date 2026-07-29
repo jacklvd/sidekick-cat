@@ -9,7 +9,8 @@ dedupes deliveries, acks (202), and hands the real work to a background task.
 The background flows: pr_open runs the deterministic flow (welcome+assign,
 validate, label) plus the gated AI summary; /review runs the gated AI review;
 /merge runs the merge gate; /context (re)generates the cached project-context
-doc. All reuse the scripts' host-agnostic run() cores.
+doc; a reply in a bot review thread runs `reply_thread`. All reuse the scripts'
+host-agnostic run() cores.
 """
 
 import logging
@@ -17,7 +18,7 @@ import os
 
 from fastapi import BackgroundTasks, FastAPI, Request, Response
 
-from scripts import gh, label_pr, merge_pr, repo_context, review_pr, summarize_pr, validate_pr, welcome
+from scripts import gh, label_pr, merge_pr, repo_context, reply_thread, review_pr, summarize_pr, validate_pr, welcome
 from scripts.gh import get_pr_diff, repo_from_token
 from scripts.limits import delivery_seen
 from server.gh_app_auth import installation_token
@@ -80,6 +81,11 @@ def dispatch(intent: dict) -> None:
                 else "🐱 Sidekick is taking a breather — try `/context` again later."
             )
             gh.upsert_comment(repo, number, "bot:context-ack", msg)
+        elif kind == "thread_reply":
+            # Author replied inside a bot review thread → answer in-thread. No 👀 ack:
+            # the trigger is a review comment, not an issue comment, and the reply
+            # itself is the acknowledgement.
+            reply_thread.run(repo, number, intent["in_reply_to_id"])
         else:
             log.info("dispatch %s: no handler, ignoring", kind)
     except Exception:

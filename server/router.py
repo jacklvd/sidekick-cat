@@ -2,9 +2,11 @@
 workflow `if:` guards. Pure function, so it self-checks offline.
 
 `classify` returns an intent dict with a `kind`:
-  - "ignore"  : drop (bot loop guard, irrelevant event, unauthorized commenter)
-  - "pr_open" : run the PR-open flow
-  - "command" : run a slash command ("review" | "merge" | "context")
+  - "ignore"       : drop (bot loop guard, irrelevant event, unauthorized commenter)
+  - "pr_open"      : run the PR-open flow
+  - "pr_update"    : run the PR-update flow
+  - "command"      : run a slash command ("review" | "merge" | "context")
+  - "thread_reply" : answer an author's reply in a bot review thread
 This just routes + acks; the real flows run downstream in the background task.
 """
 
@@ -75,6 +77,25 @@ def classify(event: str, body: dict) -> dict:
         return {
             "kind": "command", "command": command, "owner": owner, "repo": repo,
             "number": issue.get("number"), "comment_id": comment.get("id"),
+            "installation_id": installation_id,
+        }
+
+    # An author replying inside a review thread → let Sidekick answer there. Only
+    # replies (in_reply_to_id set): a brand-new inline thread the human starts isn't
+    # ours to answer. The bot's own replies are already dropped by the loop guard
+    # above. Whether the thread is actually bot-owned needs an API call, so that
+    # check lives in the flow (reply_thread.run), keeping this classifier pure.
+    if event == "pull_request_review_comment" and action == "created":
+        comment = body.get("comment", {})
+        if comment.get("author_association") not in AUTHORIZED:
+            return {"kind": "ignore", "reason": "unauthorized commenter"}
+        if comment.get("in_reply_to_id") is None:
+            return {"kind": "ignore", "reason": "new thread, not a reply"}
+        pr = body.get("pull_request", {})
+        return {
+            "kind": "thread_reply", "owner": owner, "repo": repo,
+            "number": pr.get("number"), "comment_id": comment.get("id"),
+            "in_reply_to_id": comment.get("in_reply_to_id"),
             "installation_id": installation_id,
         }
 

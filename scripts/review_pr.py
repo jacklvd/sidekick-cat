@@ -33,6 +33,11 @@ from scripts.llm_client import complete, truncate_diff
 
 _INLINE_MARKER = "bot:review-inline"
 
+# Note appended to a stale thread root that has replies (see _resolved_note): we edit
+# rather than delete so the human's reply isn't orphaned. prior_issues_text keys on this
+# to stop re-feeding an already-resolved root as a "still-open" issue.
+_RESOLVED_NOTE = "_🐱 The latest review no longer flags this._"
+
 # Friendly display names for review models — config's ids are ugly for user copy.
 _MODEL_LABELS = {
     "z-ai/glm-5.2": "GLM-5.2",
@@ -276,14 +281,31 @@ def _inline_body(issue) -> str:
     return f"{prefix}{str(issue.get('body', '')).strip()}\n<!-- {_INLINE_MARKER} -->"
 
 
+def _resolved_note(body: str) -> str:
+    """Mark a stale root that has replies as no-longer-flagged, idempotently. We
+    can't delete it — that would orphan the human's reply — and resolution stays
+    the human's call (the /merge gate keys on thread resolution, not on us)."""
+    text = body or ""
+    if _RESOLVED_NOTE in text:
+        return text
+    base = text.split(f"<!-- {_INLINE_MARKER} -->")[0].rstrip()
+    return f"{base}\n\n{_RESOLVED_NOTE}\n<!-- {_INLINE_MARKER} -->"
+
+
 def reconcile_inline(repo, pr_number, head_sha, anchorable, scope=None):
     """Keep/edit matching comments, delete stale ones, create new ones. Keyed on
-    (path, line). Editing keeps the thread + its resolution state intact.
-    `scope` is the set of file paths this review actually looked at (incremental
-    runs); stale comments OUTSIDE it are kept — the model never re-judged them."""
+    (path, line) over thread ROOTS only. Editing keeps the thread + its resolution
+    state intact. `scope` is the set of file paths this review actually looked at
+    (incremental runs); stale comments OUTSIDE it are kept — the model never
+    re-judged them. A stale root that HAS replies (a conversation happened) is noted,
+    not deleted: deleting the root would orphan the human's words."""
+    tag = f"<!-- {_INLINE_MARKER} -->"
+    all_comments = gh.get_review_comments(repo, pr_number)
+    has_reply = {c.in_reply_to_id for c in all_comments if c.in_reply_to_id is not None}
     existing = {
         (c.path, c.line): c
-        for c in gh.get_inline_comments(repo, pr_number, _INLINE_MARKER)
+        for c in all_comments
+        if tag in (c.body or "") and c.in_reply_to_id is None
     }
     desired = {(it["path"], it["line"]): it for it in anchorable}
     for key, it in desired.items():
@@ -296,8 +318,14 @@ def reconcile_inline(repo, pr_number, head_sha, anchorable, scope=None):
         elif (c.body or "") != body:
             c.edit(body)
     for key, c in existing.items():
-        if key not in desired and (scope is None or key[0] in scope):
-            c.delete()  # issue no longer reported
+        if key in desired or (scope is not None and key[0] not in scope):
+            continue
+        if c.id in has_reply:
+            new = _resolved_note(c.body or "")
+            if new != (c.body or ""):
+                c.edit(new)
+        else:
+            c.delete()  # lonely stale root — issue no longer reported
 
 
 def _unanchorable_md(issues) -> str:
@@ -333,6 +361,8 @@ def prior_issues_text(comments, scope) -> str:
             continue
         if c.path not in scope:
             continue
+        if _RESOLVED_NOTE in (c.body or ""):
+            continue  # already resolved-away (see _resolved_note) — not a still-open issue
         lines.append(f"- {c.path}:{c.line} — {_clean_prior_body(c.body or '')}")
     return "\n".join(lines)
 

@@ -746,8 +746,15 @@ def test_reconcile_scope():
         def edit(self, body):
             pass
 
-    orig = (rp.gh.get_inline_comments, rp.gh.create_review_comment)
-    rp.gh.get_inline_comments = lambda *a: [C("a.py", 1), C("b.py", 2)]
+    orig = (rp.gh.get_review_comments, rp.gh.create_review_comment)
+
+    def mk(cid, path, line):
+        c = C(path, line)
+        c.id, c.in_reply_to_id = cid, None
+        c.body = "x\n<!-- bot:review-inline -->"
+        return c
+
+    rp.gh.get_review_comments = lambda repo, n: [mk(1, "a.py", 1), mk(2, "b.py", 2)]
     rp.gh.create_review_comment = lambda *a: None
     try:
         rp.reconcile_inline(None, 1, "sha", [], scope={"a.py"})
@@ -756,7 +763,42 @@ def test_reconcile_scope():
         rp.reconcile_inline(None, 1, "sha", [])
         assert sorted(deleted) == [("a.py", 1), ("b.py", 2)]  # full review -> all stale
     finally:
-        rp.gh.get_inline_comments, rp.gh.create_review_comment = orig
+        rp.gh.get_review_comments, rp.gh.create_review_comment = orig
+
+
+def test_reconcile_keeps_threads_that_have_replies():
+    import scripts.review_pr as rp
+
+    deleted, edited = [], []
+
+    class C:
+        def __init__(self, cid, path, line, reply_to=None):
+            self.id, self.path, self.line = cid, path, line
+            self.body = "**[major]** x\n<!-- bot:review-inline -->" if reply_to is None else "human reply"
+            self.in_reply_to_id = reply_to
+
+        def delete(self):
+            deleted.append(self.id)
+
+        def edit(self, body):
+            edited.append((self.id, body))
+
+    # a.py:1 is a lonely stale root -> deletable; b.py:2 is a stale root WITH a human reply
+    root_a = C(1, "a.py", 1)
+    root_b = C(2, "b.py", 2)
+    reply_b = C(3, "b.py", 2, reply_to=2)
+
+    orig = (rp.gh.get_review_comments, rp.gh.create_review_comment)
+    rp.gh.get_review_comments = lambda repo, n: [root_a, root_b, reply_b]
+    rp.gh.create_review_comment = lambda *a: None
+    try:
+        rp.reconcile_inline(None, 1, "sha", [])   # nothing desired -> both roots are stale
+        assert deleted == [1]                      # lonely root deleted
+        assert edited and edited[0][0] == 2        # replied-to root edited, not deleted
+        assert "no longer flags this" in edited[0][1]
+        assert 2 not in deleted and 3 not in deleted
+    finally:
+        rp.gh.get_review_comments, rp.gh.create_review_comment = orig
 
 
 def test_review_incremental():
@@ -1013,6 +1055,23 @@ def test_prior_issues_text_roots_in_scope_only():
     assert prior_issues_text([], scope={"a.py"}) == ""
 
 
+def test_prior_issues_text_skips_resolved_roots():
+    from scripts.review_pr import _RESOLVED_NOTE, prior_issues_text
+
+    class C:
+        def __init__(self, path, line, body, reply_to=None):
+            self.path, self.line, self.body = path, line, body
+            self.in_reply_to_id = reply_to
+
+    comments = [
+        C("a.py", 10, "**[major]** still broken\n<!-- bot:review-inline -->"),
+        C("a.py", 20, f"**[nit]** old thing\n\n{_RESOLVED_NOTE}\n<!-- bot:review-inline -->"),
+    ]
+    out = prior_issues_text(comments, scope={"a.py"})
+    assert "a.py:10" in out and "still broken" in out   # genuinely open -> included
+    assert "a.py:20" not in out                          # already resolved-away -> skipped
+
+
 def test_build_prompt_includes_prior_issues():
     from scripts.review_pr import build_prompt
 
@@ -1065,6 +1124,175 @@ def test_run_feeds_prior_issues_on_incremental():
         limits._reset()
 
 
+def test_reply_thread_prompt_pieces():
+    from scripts.reply_thread import build_reply_prompt, render_thread
+
+    class C:
+        def __init__(self, login, body):
+            self.user = type("U", (), {"login": login})()
+            self.body = body
+
+    thread = [C("sidekick-cat[bot]", "This looks off."), C("dev", "Why? It's intentional.")]
+    t = render_thread(thread)
+    assert "sidekick-cat[bot]" in t and "This looks off." in t
+    assert "dev" in t and "Why? It's intentional." in t
+    assert t.index("This looks off.") < t.index("Why?")  # chronological
+
+    p = build_reply_prompt("rules", "1| x = 1\n", "a.py", "@@ -1 +1 @@\n+x = 1", t)
+    assert "rules" in p and "a.py" in p and "1| x = 1" in p
+    assert "@@ -1 +1 @@" in p and "Why? It's intentional." in p
+
+
+def test_reply_thread_run_only_answers_bot_threads():
+    import scripts.reply_thread as rt
+    from scripts import limits
+
+    posted = []
+
+    class C:
+        def __init__(self, body, path="a.py", id=99):
+            self.body, self.path, self.diff_hunk, self.id = body, path, "@@", id
+            self.user = type("U", (), {"login": "dev"})()
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h"})})()
+
+    orig = (rt.gh.get_review_comment_thread, rt.gh.get_file_text,
+            rt.gh.create_review_comment_reply, rt.complete)
+    rt.gh.get_file_text = lambda repo, path, ref=None: "rules"
+    rt.gh.create_review_comment_reply = lambda repo, n, rid, body: posted.append((rid, body))
+    rt.complete = lambda s, u, t: "Here's why."
+    try:
+        limits._reset()
+        # a non-bot thread root (no marker) -> no reply, no model call
+        rt.gh.get_review_comment_thread = lambda repo, n, rid: (C("just a human note"), [C("just a human note")])
+        rt.run(FakeRepo(), 1, 5)
+        assert posted == []
+
+        # a bot thread -> reply posted to the RESOLVED root id, carrying marker + persona.
+        # rid=5 is passed to run() but the resolved root has id 99: the reply must target 99.
+        root = C("**[major]** bug\n<!-- bot:review-inline -->", id=99)
+        rt.gh.get_review_comment_thread = lambda repo, n, rid: (root, [root, C("why?", id=100)])
+        rt.run(FakeRepo(), 1, 5)
+        assert len(posted) == 1 and posted[0][0] == 99  # posted to the root, not the webhook id
+        assert "🐱" in posted[0][1] and "bot:review-reply" in posted[0][1]
+
+        # a failed completion (⚠️) -> silence
+        posted.clear()
+        rt.complete = lambda s, u, t: "⚠️ AI quota reached, try again later."
+        rt.run(FakeRepo(), 1, 5)
+        assert posted == []
+    finally:
+        (rt.gh.get_review_comment_thread, rt.gh.get_file_text,
+         rt.gh.create_review_comment_reply, rt.complete) = orig
+        limits._reset()
+
+
+def test_classify_thread_reply():
+    from server.router import classify
+
+    def payload(assoc="MEMBER", reply_to=42, sender_type="User", login="dev"):
+        return {
+            "sender": {"type": sender_type, "login": login},
+            "repository": {"full_name": "o/r"},
+            "installation": {"id": 9},
+            "action": "created",
+            "pull_request": {"number": 7},
+            "comment": {"id": 100, "in_reply_to_id": reply_to, "author_association": assoc},
+        }
+
+    got = classify("pull_request_review_comment", payload())
+    assert got["kind"] == "thread_reply"
+    assert got["number"] == 7 and got["comment_id"] == 100 and got["in_reply_to_id"] == 42
+    assert got["owner"] == "o" and got["repo"] == "r" and got["installation_id"] == 9
+
+    # a new thread (not a reply) is ignored — replies only
+    assert classify("pull_request_review_comment", payload(reply_to=None))["kind"] == "ignore"
+    # unauthorized commenter ignored
+    assert classify("pull_request_review_comment", payload(assoc="NONE"))["kind"] == "ignore"
+    # the bot's own reply is ignored by the existing loop guard
+    assert classify("pull_request_review_comment",
+                    payload(sender_type="Bot", login="sidekick-cat[bot]"))["kind"] == "ignore"
+
+
+def test_review_comment_helpers():
+    from scripts import gh
+
+    class C:
+        def __init__(self, cid, path, line, body, reply_to=None):
+            self.id, self.path, self.line, self.body = cid, path, line, body
+            self.in_reply_to_id = reply_to
+
+    root = C(1, "a.py", 10, "**[major]** bug\n<!-- bot:review-inline -->")
+    human = C(2, "a.py", 10, "why?", reply_to=1)
+    other_root = C(3, "b.py", 5, "note\n<!-- bot:review-inline -->")
+    # a reply that ALSO carries the marker (e.g. the bot's own answer) must still be
+    # excluded — proves the in_reply_to_id filter, not just the marker filter
+    marked_reply = C(4, "a.py", 10, "ack\n<!-- bot:review-inline -->", reply_to=1)
+    replied = []
+
+    class Pull:
+        def get_review_comments(self):
+            return [root, human, other_root, marked_reply]
+
+        def create_review_comment_reply(self, comment_id, body):
+            replied.append((comment_id, body))
+
+    class FakeRepo:
+        def get_pull(self, n):
+            return Pull()
+
+    # get_inline_comments returns ROOTS with the marker only — both the unmarked human
+    # reply (id 2) and the MARKED reply (id 4) are excluded; only roots 1 and 3 remain
+    roots = gh.get_inline_comments(FakeRepo(), 1, "bot:review-inline")
+    assert [c.id for c in roots] == [1, 3]
+
+    # get_review_comment_thread returns the root + its replies, in id order
+    r, thread = gh.get_review_comment_thread(FakeRepo(), 1, 1)
+    assert r is root and [c.id for c in thread] == [1, 2, 4]
+
+    # a missing root -> (None, [])
+    assert gh.get_review_comment_thread(FakeRepo(), 1, 999) == (None, [])
+
+    gh.create_review_comment_reply(FakeRepo(), 1, 1, "hi")
+    assert replied == [(1, "hi")]
+
+
+def test_get_review_comment_thread_resolves_root_from_any_comment():
+    # Passing a REPLY's id (or a webhook's in_reply_to_id) must resolve up to the thread
+    # root, so the flow keys off the root's marker and posts to the root — not a reply.
+    from scripts import gh
+
+    class C:
+        def __init__(self, cid, path, line, body, reply_to=None):
+            self.id, self.path, self.line, self.body = cid, path, line, body
+            self.in_reply_to_id = reply_to
+
+    root = C(1, "a.py", 10, "**[major]** bug\n<!-- bot:review-inline -->")
+    reply = C(2, "a.py", 10, "why?", reply_to=1)
+    reply2 = C(3, "a.py", 10, "still?", reply_to=1)
+
+    class Pull:
+        def get_review_comments(self):
+            return [root, reply, reply2]
+
+    class FakeRepo:
+        def get_pull(self, n):
+            return Pull()
+
+    # given a reply id -> resolves to the root, returns the whole thread in id order
+    r, thread = gh.get_review_comment_thread(FakeRepo(), 1, 2)
+    assert r is root and [c.id for c in thread] == [1, 2, 3]
+    # given the root id directly -> unchanged behavior
+    r2, thread2 = gh.get_review_comment_thread(FakeRepo(), 1, 1)
+    assert r2 is root and [c.id for c in thread2] == [1, 2, 3]
+    # an unknown id -> (None, [])
+    assert gh.get_review_comment_thread(FakeRepo(), 1, 999) == (None, [])
+
+
 if __name__ == "__main__":
     test_missing_sections()
     test_labels_for()
@@ -1100,6 +1328,7 @@ if __name__ == "__main__":
     test_context_issue_upsert()
     test_unified_from_files()
     test_reconcile_scope()
+    test_reconcile_keeps_threads_that_have_replies()
     test_review_incremental()
     test_number_diff()
     test_partition_snaps_near_misses()
@@ -1109,6 +1338,12 @@ if __name__ == "__main__":
     test_unresolved_count()
     test_merge_gating()
     test_prior_issues_text_roots_in_scope_only()
+    test_prior_issues_text_skips_resolved_roots()
     test_build_prompt_includes_prior_issues()
     test_run_feeds_prior_issues_on_incremental()
+    test_classify_thread_reply()
+    test_review_comment_helpers()
+    test_get_review_comment_thread_resolves_root_from_any_comment()
+    test_reply_thread_prompt_pieces()
+    test_reply_thread_run_only_answers_bot_threads()
     print("ok")

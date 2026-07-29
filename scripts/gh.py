@@ -142,10 +142,48 @@ def submit_review(repo, pr_number, body, event):
     repo.get_pull(pr_number).create_review(body=body, event=event)
 
 
+def get_review_comments(repo, pr_number):
+    """Every review (inline) comment on the PR — thread roots and replies alike.
+    One API round-trip; callers that need only roots filter on in_reply_to_id."""
+    return list(repo.get_pull(pr_number).get_review_comments())
+
+
 def get_inline_comments(repo, pr_number, marker):
-    """The bot's existing inline review comments (those carrying the marker)."""
+    """The bot's inline thread ROOTS carrying `marker`. Roots only (in_reply_to_id
+    is None): a reply — the bot's own answer, or a human's — must never be keyed as
+    an existing comment, or reconcile_inline would collide it with its own thread."""
     tag = f"<!-- {marker} -->"
-    return [c for c in repo.get_pull(pr_number).get_review_comments() if tag in (c.body or "")]
+    return [
+        c for c in get_review_comments(repo, pr_number)
+        if tag in (c.body or "") and c.in_reply_to_id is None
+    ]
+
+
+def get_review_comment_thread(repo, pr_number, comment_id):
+    """(root, [root, ...replies]) for the thread CONTAINING `comment_id`, in id order
+    (≈ chronological). (None, []) if the comment is gone. Feeds reply_thread with the
+    conversation so far.
+
+    `comment_id` may be any comment in the thread, not just the root: we walk
+    `in_reply_to_id` up to the root (the comment with none). A webhook delivers the id
+    of the comment a reply answers, and while GitHub review threads are flat today (so
+    that id is already the root), resolving explicitly means the flow can't silently
+    no-op if that ever stops holding — a webhook path is miserable to debug live."""
+    comments = get_review_comments(repo, pr_number)
+    by_id = {c.id: c for c in comments}
+    node = by_id.get(comment_id)
+    while node is not None and node.in_reply_to_id is not None:
+        node = by_id.get(node.in_reply_to_id)
+    if node is None:
+        return None, []
+    thread = [node] + [c for c in comments if c.in_reply_to_id == node.id]
+    thread.sort(key=lambda c: c.id)
+    return node, thread
+
+
+def create_review_comment_reply(repo, pr_number, root_id, body):
+    """Post `body` as a reply in the thread rooted at `root_id`."""
+    repo.get_pull(pr_number).create_review_comment_reply(root_id, body)
 
 
 def create_review_comment(repo, pr_number, head_sha, path, line, body):
