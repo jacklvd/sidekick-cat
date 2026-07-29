@@ -77,7 +77,7 @@ def dispatch(intent: dict) -> None:
             _safe("check", check_run.refresh, repo, number, token)
         elif kind == "command" and intent.get("command") == "review":
             gh.react(repo, number, intent["comment_id"])  # 👀 immediate ack on the comment
-            review_pr.run(repo, number, get_pr_diff(full_name, number, token))
+            review_pr.run(repo, number, get_pr_diff(full_name, number, token), token)
         elif kind == "command" and intent.get("command") == "merge":
             gh.react(repo, number, intent["comment_id"])  # 👀 immediate ack on the comment
             merge_pr.run(repo, number, token)
@@ -118,7 +118,7 @@ def _review_and_check(repo, full_name: str, number, token: str, intent: dict) ->
 def _review(repo, full_name: str, number, token: str) -> str:
     """Fetch the diff (REST, no `gh` CLI) and run the gated AI review. Returns
     "done"/"failed" so the caller can conclude the check."""
-    return review_pr.run(repo, number, get_pr_diff(full_name, number, token))
+    return review_pr.run(repo, number, get_pr_diff(full_name, number, token), token)
 
 
 def _safe(name: str, fn, *args) -> None:

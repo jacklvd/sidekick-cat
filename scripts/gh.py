@@ -33,6 +33,60 @@ def graphql(token, query, variables):
         return json.loads(resp.read())
 
 
+_THREADS_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){"
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+    "reviewThreads(first:100){nodes{id isResolved "
+    "comments(first:1){nodes{databaseId}}}}}}}"
+)
+_RESOLVE_MUT = "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+_UNRESOLVE_MUT = "mutation($id:ID!){unresolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+
+
+def review_thread_state(repo, pr_number, token):
+    """{root comment databaseId -> (thread node id, is_resolved)} for every review
+    thread on the PR. databaseId joins to a REST comment's `.id`, so reconcile can find
+    a root's GraphQL thread — resolution is GraphQL-only, REST comments don't carry it.
+
+    Best-effort: returns {} if the read fails, so reconcile degrades to edit/create
+    without resolving (never deletes)."""
+    owner, name = repo.full_name.split("/", 1)
+    try:
+        data = graphql(token, _THREADS_QUERY, {"owner": owner, "name": name, "number": pr_number})
+        nodes = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    except Exception:
+        log.warning("review_thread_state read failed for PR #%s", pr_number, exc_info=True)
+        return {}
+    state = {}
+    for n in nodes:
+        roots = (n.get("comments") or {}).get("nodes") or []
+        if roots and roots[0].get("databaseId") is not None:
+            state[roots[0]["databaseId"]] = (n["id"], bool(n["isResolved"]))
+    return state
+
+
+def resolve_thread(token, thread_id):
+    """Mark a review thread resolved (GraphQL). Best-effort — logs and returns on
+    failure so one thread not resolving doesn't abort the reconcile.
+
+    dev-note: needs the App's `pull_requests: write` (it authors these threads). If it
+    ever 403s, the reconcile still adds the "no longer flags this" note; the thread just
+    stays open — no worse than the pre-resolve behavior, and no data lost."""
+    try:
+        graphql(token, _RESOLVE_MUT, {"id": thread_id})
+    except Exception:
+        log.warning("resolve_thread failed for %s", thread_id, exc_info=True)
+
+
+def unresolve_thread(token, thread_id):
+    """Mark a review thread unresolved (GraphQL) — a fixed issue that recurred, so the
+    merge gate must count it again. Best-effort, same rationale as resolve_thread."""
+    try:
+        graphql(token, _UNRESOLVE_MUT, {"id": thread_id})
+    except Exception:
+        log.warning("unresolve_thread failed for %s", thread_id, exc_info=True)
+
+
 def get_check_run(repo, head_sha, name):
     """The check run named `name` on `head_sha`, or None. `get_check_runs` filters
     server-side by name, so the first result is the one we own (only this App creates

@@ -282,9 +282,9 @@ def _inline_body(issue) -> str:
 
 
 def _resolved_note(body: str) -> str:
-    """Mark a stale root that has replies as no-longer-flagged, idempotently. We
-    can't delete it — that would orphan the human's reply — and resolution stays
-    the human's call (the /merge gate keys on thread resolution, not on us)."""
+    """Append the "no longer flags this" note to a stale root, idempotently.
+    reconcile_inline then resolves the thread, so the note explains WHY it's resolved
+    — a visible trail rather than a delete that erased the evidence."""
     text = body or ""
     if _RESOLVED_NOTE in text:
         return text
@@ -292,40 +292,55 @@ def _resolved_note(body: str) -> str:
     return f"{base}\n\n{_RESOLVED_NOTE}\n<!-- {_INLINE_MARKER} -->"
 
 
-def reconcile_inline(repo, pr_number, head_sha, anchorable, scope=None):
-    """Keep/edit matching comments, delete stale ones, create new ones. Keyed on
-    (path, line) over thread ROOTS only. Editing keeps the thread + its resolution
-    state intact. `scope` is the set of file paths this review actually looked at
-    (incremental runs); stale comments OUTSIDE it are kept — the model never
-    re-judged them. A stale root that HAS replies (a conversation happened) is noted,
-    not deleted: deleting the root would orphan the human's words."""
+def reconcile_inline(repo, pr_number, head_sha, anchorable, token, scope=None):
+    """Keep/edit matching comments, RESOLVE stale ones (not delete), create new ones.
+    Keyed on (path, line) over thread ROOTS only. `scope` is the set of file paths this
+    review actually looked at (incremental runs); stale roots OUTSIDE it are kept
+    untouched — the model never re-judged them.
+
+    A stale root (issue no longer flagged, in scope) is marked with a note and its
+    thread RESOLVED — a visible, collapsed trail out of the unresolved count, instead of
+    a `delete()` that erased the evidence. If a resolved thread's issue RECURS at the
+    same (path, line), the thread is un-resolved so the merge gate re-catches it.
+
+    Resolution is GraphQL, so `token` is required. `review_thread_state` degrades to {}
+    on failure, in which case resolve/unresolve are skipped (the note still lands) —
+    never destructive."""
     tag = f"<!-- {_INLINE_MARKER} -->"
     all_comments = gh.get_review_comments(repo, pr_number)
-    has_reply = {c.in_reply_to_id for c in all_comments if c.in_reply_to_id is not None}
     existing = {
         (c.path, c.line): c
         for c in all_comments
         if tag in (c.body or "") and c.in_reply_to_id is None
     }
+    # {root databaseId -> (thread node id, is_resolved)}; c.id joins to databaseId.
+    threads = gh.review_thread_state(repo, pr_number, token)
     desired = {(it["path"], it["line"]): it for it in anchorable}
+
     for key, it in desired.items():
         body = _inline_body(it)
         c = existing.get(key)
         if c is None:
-            gh.create_review_comment(
-                repo, pr_number, head_sha, it["path"], it["line"], body
-            )
-        elif (c.body or "") != body:
-            c.edit(body)
+            gh.create_review_comment(repo, pr_number, head_sha, it["path"], it["line"], body)
+            continue
+        if (c.body or "") != body:
+            c.edit(body)  # clean issue body — overwrites any stale "no longer flags" note
+        # The issue recurred on a thread we'd resolved -> reopen so the gate counts it.
+        node_id, is_resolved = threads.get(c.id, (None, False))
+        if node_id is not None and is_resolved:
+            gh.unresolve_thread(token, node_id)
+
     for key, c in existing.items():
         if key in desired or (scope is not None and key[0] not in scope):
             continue
-        if c.id in has_reply:
-            new = _resolved_note(c.body or "")
-            if new != (c.body or ""):
-                c.edit(new)
-        else:
-            c.delete()  # lonely stale root — issue no longer reported
+        # Stale root — issue no longer reported. Note WHY, then resolve (don't delete)
+        # so the trail survives. Idempotent: an already-resolved+noted thread no-ops.
+        new = _resolved_note(c.body or "")
+        if new != (c.body or ""):
+            c.edit(new)
+        node_id, is_resolved = threads.get(c.id, (None, False))
+        if node_id is not None and not is_resolved:
+            gh.resolve_thread(token, node_id)
 
 
 def _unanchorable_md(issues) -> str:
@@ -367,8 +382,11 @@ def prior_issues_text(comments, scope) -> str:
     return "\n".join(lines)
 
 
-def run(repo, pr_number, diff):
-    """Full /review, gated by head-SHA dedup + daily caps. Host-agnostic core."""
+def run(repo, pr_number, diff, token=None):
+    """Full /review, gated by head-SHA dedup + daily caps. Host-agnostic core.
+    `token` is used only to resolve/un-resolve stale inline threads (GraphQL); every
+    real caller (dispatch, /review, Actions main) passes it. With None, reconcile still
+    edits/creates and notes stale threads — it just can't resolve them."""
     pr = repo.get_pull(pr_number)
     head_sha = pr.head.sha
     prev = limits.reviewed_head(repo.full_name, pr_number)
@@ -500,7 +518,7 @@ def run(repo, pr_number, diff):
     anchorable, unanchorable = partition(issues, anchor_map)
 
     reconcile_inline(
-        repo, pr_number, head_sha, anchorable,
+        repo, pr_number, head_sha, anchorable, token,
         scope=set(anchor_map) if incremental else None,
     )
 
@@ -529,7 +547,7 @@ def main():
     diff = Path(os.environ["PR_DIFF_FILE"]).read_text(
         encoding="utf-8", errors="replace"
     )
-    run(gh.get_repo(), pr_number, diff)
+    run(gh.get_repo(), pr_number, diff, os.environ["GH_TOKEN"])
 
 
 if __name__ == "__main__":

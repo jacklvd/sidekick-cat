@@ -34,7 +34,7 @@ def test_kind_from_title():
     # real titles from this repo's history
     assert kind_from_title("feat: wire 3 more NVIDIA rungs") == "enhancement"
     assert kind_from_title("fix: survive Groq's July 17 decommission") == "bug"
-    assert kind_from_title("chore: refresh Sidekick activity heatmap") == "chore"
+    assert kind_from_title("chore: refresh Sidekick activity") == "chore"
     assert kind_from_title("docs: mention /context in the welcome template") == "documentation"
     # conventional-commit shapes: scope, breaking bang, odd casing
     assert kind_from_title("feat(review): add symbol outline") == "enhancement"
@@ -704,75 +704,139 @@ def test_unified_from_files():
     assert "gone.py" not in a and "bin.png" not in out
 
 
-def test_reconcile_scope():
-    # scope limits stale-deletion to the re-reviewed files; None means everything.
+class _RC:
+    """A fake review comment root. No delete() on purpose — a delete() call would
+    AttributeError and fail the test, which is how we assert reconcile never deletes."""
+
+    def __init__(self, cid, path, line, body="x\n<!-- bot:review-inline -->"):
+        self.id, self.path, self.line, self.body = cid, path, line, body
+        self.in_reply_to_id = None
+
+    def edit(self, body):
+        self.body = body
+
+
+def _reconcile_fakes(rp, comments, thread_state):
+    """Wire the gh calls reconcile_inline makes; return (edited, resolved, unresolved)
+    capture lists and the originals to restore."""
+    edited, resolved, unresolved = [], [], []
+    _orig_edit = _RC.edit
+    _RC.edit = lambda self, body: (_orig_edit(self, body), edited.append((self.id, body)))[0]
+    orig = (rp.gh.get_review_comments, rp.gh.create_review_comment,
+            rp.gh.review_thread_state, rp.gh.resolve_thread, rp.gh.unresolve_thread)
+    rp.gh.get_review_comments = lambda repo, n: comments
+    rp.gh.create_review_comment = lambda *a, **k: None
+    rp.gh.review_thread_state = lambda repo, n, token: thread_state
+    rp.gh.resolve_thread = lambda token, tid: resolved.append(tid)
+    rp.gh.unresolve_thread = lambda token, tid: unresolved.append(tid)
+
+    def restore():
+        _RC.edit = _orig_edit
+        (rp.gh.get_review_comments, rp.gh.create_review_comment,
+         rp.gh.review_thread_state, rp.gh.resolve_thread, rp.gh.unresolve_thread) = orig
+
+    return edited, resolved, unresolved, restore
+
+
+def test_reconcile_resolves_stale_instead_of_deleting():
+    # A stale root (issue no longer flagged, in scope) is RESOLVED + noted, never
+    # deleted; a stale root OUTSIDE scope is left untouched.
     import scripts.review_pr as rp
 
-    deleted = []
-
-    class C:
-        def __init__(self, path, line):
-            self.path, self.line, self.body = path, line, "b"
-
-        def delete(self):
-            deleted.append((self.path, self.line))
-
-        def edit(self, body):
-            pass
-
-    orig = (rp.gh.get_review_comments, rp.gh.create_review_comment)
-
-    def mk(cid, path, line):
-        c = C(path, line)
-        c.id, c.in_reply_to_id = cid, None
-        c.body = "x\n<!-- bot:review-inline -->"
-        return c
-
-    rp.gh.get_review_comments = lambda repo, n: [mk(1, "a.py", 1), mk(2, "b.py", 2)]
-    rp.gh.create_review_comment = lambda *a: None
+    a, b = _RC(1, "a.py", 1), _RC(2, "b.py", 2)
+    edited, resolved, unresolved, restore = _reconcile_fakes(
+        rp, [a, b], {1: ("T1", False), 2: ("T2", False)})
     try:
-        rp.reconcile_inline(None, 1, "sha", [], scope={"a.py"})
-        assert deleted == [("a.py", 1)]  # b.py untouched by this review -> kept
-        deleted.clear()
-        rp.reconcile_inline(None, 1, "sha", [])
-        assert sorted(deleted) == [("a.py", 1), ("b.py", 2)]  # full review -> all stale
+        # incremental review looked only at a.py: a.py:1 is stale-in-scope -> resolve;
+        # b.py:2 is out of scope -> untouched.
+        rp.reconcile_inline(None, 1, "sha", [], "tok", scope={"a.py"})
+        assert resolved == ["T1"] and unresolved == []
+        assert any(cid == 1 and "no longer flags this" in body for cid, body in edited)
+        assert all(cid != 2 for cid, _ in edited)  # b.py never touched
+
+        # full review (scope=None): both stale -> both resolved.
+        edited.clear(); resolved.clear()
+        a.body = b.body = "x\n<!-- bot:review-inline -->"
+        rp.reconcile_inline(None, 1, "sha", [], "tok")
+        assert sorted(resolved) == ["T1", "T2"]
     finally:
-        rp.gh.get_review_comments, rp.gh.create_review_comment = orig
+        restore()
 
 
-def test_reconcile_keeps_threads_that_have_replies():
+def test_reconcile_unresolves_on_recurrence_and_degrades_safe():
     import scripts.review_pr as rp
 
-    deleted, edited = [], []
-
-    class C:
-        def __init__(self, cid, path, line, reply_to=None):
-            self.id, self.path, self.line = cid, path, line
-            self.body = "**[major]** x\n<!-- bot:review-inline -->" if reply_to is None else "human reply"
-            self.in_reply_to_id = reply_to
-
-        def delete(self):
-            deleted.append(self.id)
-
-        def edit(self, body):
-            edited.append((self.id, body))
-
-    # a.py:1 is a lonely stale root -> deletable; b.py:2 is a stale root WITH a human reply
-    root_a = C(1, "a.py", 1)
-    root_b = C(2, "b.py", 2)
-    reply_b = C(3, "b.py", 2, reply_to=2)
-
-    orig = (rp.gh.get_review_comments, rp.gh.create_review_comment)
-    rp.gh.get_review_comments = lambda repo, n: [root_a, root_b, reply_b]
-    rp.gh.create_review_comment = lambda *a: None
+    # (1) recurrence: a resolved thread whose issue is back in `desired` -> unresolve +
+    #     rewrite the body clean (the "no longer flags" note is dropped).
+    root = _RC(1, "a.py", 1, "old\n<!-- bot:review-inline -->")
+    edited, resolved, unresolved, restore = _reconcile_fakes(
+        rp, [root], {1: ("T1", True)})  # currently resolved
     try:
-        rp.reconcile_inline(None, 1, "sha", [])   # nothing desired -> both roots are stale
-        assert deleted == [1]                      # lonely root deleted
-        assert edited and edited[0][0] == 2        # replied-to root edited, not deleted
-        assert "no longer flags this" in edited[0][1]
-        assert 2 not in deleted and 3 not in deleted
+        want = {"path": "a.py", "line": 1, "severity": "major", "body": "still broken"}
+        rp.reconcile_inline(None, 1, "sha", [want], "tok")
+        assert unresolved == ["T1"] and resolved == []
+        assert "still broken" in root.body and "no longer flags this" not in root.body
     finally:
-        rp.gh.get_review_comments, rp.gh.create_review_comment = orig
+        restore()
+
+    # (2) idempotent: a stale root already resolved + noted -> no re-resolve, no edit.
+    noted = _RC(2, "b.py", 2,
+                "x\n\n_🐱 The latest review no longer flags this._\n<!-- bot:review-inline -->")
+    edited, resolved, unresolved, restore = _reconcile_fakes(rp, [noted], {2: ("T2", True)})
+    try:
+        rp.reconcile_inline(None, 1, "sha", [], "tok")
+        assert resolved == [] and unresolved == [] and edited == []
+    finally:
+        restore()
+
+    # (3) degrade-safe: the thread-state read returned {} (GraphQL failed) -> no
+    #     resolve/unresolve and no delete; the note is still added.
+    stale = _RC(3, "c.py", 3)
+    edited, resolved, unresolved, restore = _reconcile_fakes(rp, [stale], {})
+    try:
+        rp.reconcile_inline(None, 1, "sha", [], "tok")
+        assert resolved == [] and unresolved == []
+        assert "no longer flags this" in stale.body
+    finally:
+        restore()
+
+
+def test_gh_review_thread_state_and_resolve():
+    from scripts import gh
+
+    class R:
+        full_name = "o/r"
+
+    orig = gh.graphql
+    try:
+        # review_thread_state parses {databaseId -> (node_id, is_resolved)} and skips a
+        # thread whose root comment has no databaseId.
+        gh.graphql = lambda token, q, v: {"data": {"repository": {"pullRequest": {
+            "reviewThreads": {"nodes": [
+                {"id": "T1", "isResolved": True, "comments": {"nodes": [{"databaseId": 11}]}},
+                {"id": "T2", "isResolved": False, "comments": {"nodes": [{"databaseId": 22}]}},
+                {"id": "T3", "isResolved": False, "comments": {"nodes": []}},
+            ]}}}}}
+        assert gh.review_thread_state(R(), 5, "tok") == {11: ("T1", True), 22: ("T2", False)}
+
+        # resolve/unresolve send the right mutation with the thread id.
+        captured = []
+        gh.graphql = lambda token, q, v: captured.append((q, v)) or {}
+        gh.resolve_thread("tok", "T9")
+        gh.unresolve_thread("tok", "T9")
+        assert "resolveReviewThread" in captured[0][0] and captured[0][1] == {"id": "T9"}
+        assert "unresolveReviewThread" in captured[1][0] and captured[1][1] == {"id": "T9"}
+
+        # A GraphQL failure degrades: state -> {}, mutations swallow (best-effort).
+        def boom(*a, **k):
+            raise RuntimeError("network")
+
+        gh.graphql = boom
+        assert gh.review_thread_state(R(), 5, "tok") == {}
+        gh.resolve_thread("tok", "T9")    # must not raise
+        gh.unresolve_thread("tok", "T9")  # must not raise
+    finally:
+        gh.graphql = orig
 
 
 def test_review_incremental():
@@ -798,7 +862,7 @@ def test_review_incremental():
     rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, m, body: bodies.append(body)
     rp.gh.get_file_text = lambda repo, path, ref=None: ""
-    rp.reconcile_inline = lambda repo, n, s, anch, scope=None: scopes.append(scope)
+    rp.reconcile_inline = lambda repo, n, s, anch, token, scope=None: scopes.append(scope)
     rp.gh.compare_diff = lambda repo, base, head: _block("changed.py", "+delta\n")
     rp.gh.get_inline_comments = lambda repo, n, marker: []
     rp.repo_context.ensure_fresh = lambda repo: ""
@@ -1482,8 +1546,9 @@ if __name__ == "__main__":
     test_get_tree()
     test_context_issue_upsert()
     test_unified_from_files()
-    test_reconcile_scope()
-    test_reconcile_keeps_threads_that_have_replies()
+    test_reconcile_resolves_stale_instead_of_deleting()
+    test_reconcile_unresolves_on_recurrence_and_degrades_safe()
+    test_gh_review_thread_state_and_resolve()
     test_review_incremental()
     test_number_diff()
     test_partition_snaps_near_misses()
