@@ -28,13 +28,109 @@ def test_labels_for():
     assert labels_for(["LICENSE"], rules) == []
 
 
+def test_kind_from_title():
+    from scripts.label_pr import kind_from_title
+
+    # real titles from this repo's history
+    assert kind_from_title("feat: wire 3 more NVIDIA rungs") == "enhancement"
+    assert kind_from_title("fix: survive Groq's July 17 decommission") == "bug"
+    assert kind_from_title("chore: refresh Sidekick activity heatmap") == "chore"
+    assert kind_from_title("docs: mention /context in the welcome template") == "documentation"
+    # conventional-commit shapes: scope, breaking bang, odd casing
+    assert kind_from_title("feat(review): add symbol outline") == "enhancement"
+    assert kind_from_title("refactor(api)!: drop the v1 client") == "refactor"
+    assert kind_from_title("FIX: casing shouldn't matter") == "bug"
+    assert kind_from_title("perf: cache the tree") == "refactor"
+    # no type -> None, so the diff-shape fallback gets a turn
+    assert kind_from_title("Update the scraper filter") is None
+    assert kind_from_title("") is None
+    # a colon alone is not a conventional-commit type
+    assert kind_from_title("WIP: something") is None  # 'wip' isn't in KIND_LABELS
+
+
+def test_kind_from_diff_only_speaks_when_the_shape_is_clear():
+    from scripts.label_pr import kind_from_diff
+
+    # (path, status, additions, deletions)
+    new_feature = [("a.py", "added", 120, 0), ("b.py", "modified", 10, 2)]
+    assert kind_from_diff(new_feature) == "enhancement"  # new file, little removed
+
+    deletion = [("old.py", "removed", 0, 300)]
+    assert kind_from_diff(deletion) == "refactor"  # a whole file taken out
+    assert kind_from_diff([("a.py", "modified", 5, 200)]) == "refactor"  # overwhelmingly removal
+
+    # The honest case: edits to existing files can be a fix OR a feature, so say nothing
+    # rather than guess. This repo's own "fix: survive Groq's decommission" was +180/-24 —
+    # a net-additive bugfix that a shape-only rule would have called an enhancement.
+    assert kind_from_diff([("scripts/config.py", "modified", 180, 24)]) is None
+
+    # lock-file churn is excluded before any of this — it says nothing about intent
+    assert kind_from_diff([("uv.lock", "modified", 5000, 4000)]) is None
+    assert kind_from_diff([]) is None
+
+
+def test_kind_from_branch():
+    from scripts.label_pr import kind_from_branch
+
+    assert kind_from_branch("fix/leaky-us-filter") == "bug"
+    assert kind_from_branch("feat-dark-mode") == "enhancement"
+    assert kind_from_branch("jackie/chore/bump-deps") == "chore"
+    # no conventional-commit word anywhere -> silent, so the next signal gets a turn
+    assert kind_from_branch("patch-1") is None
+    assert kind_from_branch("update-the-scraper-filter") is None
+    assert kind_from_branch("") is None
+
+
+def test_desired_labels_prefers_the_title_over_the_diff():
+    from scripts.label_pr import desired_labels, managed_labels
+
+    files = [("scripts/config.py", "modified", 180, 24)]
+    paths = ["scripts/config.py"]
+    # net-additive edit: the diff shape says nothing, but the title says "bug"
+    assert desired_labels(paths, "fix: survive the decommission", files) == ["bug", "python"]
+    # a new file would read as "enhancement" from shape alone — the title still wins
+    new = [("scripts/new.py", "added", 90, 0)]
+    assert desired_labels(["scripts/new.py"], "fix: restore the missing guard", new) == ["bug", "python"]
+    # no type in the title -> fall back to the shape
+    assert desired_labels(["scripts/new.py"], "Add a guard", new) == ["enhancement", "python"]
+    # every kind label must be in the managed universe, or a stale one could never be
+    # removed when the title is edited
+    for kind in ("enhancement", "bug", "refactor", "chore", "tests", "needs-triage"):
+        assert kind in managed_labels()
+
+
+def test_desired_labels_falls_back_to_branch_then_triage():
+    from scripts.label_pr import desired_labels
+
+    # the guest case: title says nothing, shape says nothing (edit to an existing file)
+    edit = [("scripts/config.py", "modified", 12, 3)]
+    paths = ["scripts/config.py"]
+    assert desired_labels(paths, "Update the scraper filter", edit, "patch-1") == [
+        "needs-triage",
+        "python",
+    ]
+    # ...but a branch that names its intent is taken at its word, ahead of the diff
+    assert desired_labels(paths, "Update the scraper filter", edit, "fix/us-only") == [
+        "bug",
+        "python",
+    ]
+    # the title still outranks the branch when the two disagree
+    assert desired_labels(paths, "chore: bump deps", edit, "fix/us-only") == ["chore", "python"]
+    # and the diff still gets its turn when neither title nor branch speaks
+    new = [("scripts/new.py", "added", 90, 0)]
+    assert desired_labels(["scripts/new.py"], "Add a guard", new, "patch-1") == [
+        "enhancement",
+        "python",
+    ]
+
+
 def test_summarize_empty():
     # empty/whitespace diff short-circuits (no network call to the model)
     assert "No diff" in summarize("   \n  ")
 
 
 def test_summarize_gating():
-    # run() must meter LLM calls — within budget posts a summary, over the
+    # C5: run() must meter LLM calls — within budget posts a summary, over the
     # per-PR cap posts the ratelimit note and never touches the model.
     import scripts.summarize_pr as sp
     from scripts import limits
@@ -62,7 +158,7 @@ def test_summarize_gating():
 
 
 def test_review_gating():
-    # run() must (a) skip a head SHA already reviewed (free re-/review) and
+    # C6: run() must (a) skip a head SHA already reviewed (free re-/review) and
     # (b) post the ratelimit note instead of calling the model once the per-PR cap
     # is spent.
     import scripts.review_pr as rp
@@ -82,7 +178,7 @@ def test_review_gating():
             rp.repo_context.ensure_fresh)
     rp.complete = lambda s, u, t, **kw: (modeled.append(1), '{"verdict":"approve","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, marker, body: posted.append(marker)
-    rp.gh.get_file_text = lambda repo, path: ""
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
     rp.reconcile_inline = lambda *a, **k: None
     rp.repo_context.ensure_fresh = lambda repo: ""
     try:
@@ -132,7 +228,7 @@ def test_review_routes_by_size():
             rp.repo_context.ensure_fresh)
     rp.complete = fake_complete
     rp.gh.upsert_comment = lambda repo, n, marker, body: bodies.append(body)
-    rp.gh.get_file_text = lambda repo, path: ""
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
     rp.reconcile_inline = lambda *a, **k: None
     rp.repo_context.ensure_fresh = lambda repo: ""
     try:
@@ -207,7 +303,7 @@ def test_repo_context_run_and_ensure_fresh():
     orig = (rc.gh.get_tree, rc.gh.get_file_text, rc.gh.upsert_issue,
             rc.gh.get_context_issue, rc.complete)
     rc.gh.get_tree = lambda repo: [("a.py", 10)]
-    rc.gh.get_file_text = lambda repo, name: "readme" if name == "README.md" else None
+    rc.gh.get_file_text = lambda repo, name, ref=None: "readme" if name == "README.md" else None
     rc.gh.upsert_issue = lambda repo, marker, title, body: upserted.append(body)
     rc.gh.get_context_issue = lambda repo, marker: None
     rc.complete = lambda system, user, task: "GENERATED CONTEXT"
@@ -357,6 +453,44 @@ def test_build_prompt_includes_project_context():
     assert "Project context" not in build_prompt("DIFF", conventions="")  # optional, omitted when absent
 
 
+def test_file_symbols_finds_helpers_defined_outside_the_diff():
+    from scripts.review_pr import file_symbols
+
+    # The real miss: a reviewer flagged `clean_space` as "not imported or defined" because
+    # it sat ~120 lines above the changed hunk and so never appeared in the diff.
+    source = "import re\n\n\ndef clean_space(value):\n    return value.strip()\n\n\nclass Thing:\n    def method(self):\n        pass\n"
+    syms = file_symbols(source)
+    assert "clean_space (line 4)" in syms  # the helper the reviewer couldn't see
+    assert "Thing (line 8)" in syms
+    assert not any(s.startswith("method ") for s in syms)  # nested def isn't the file's surface
+
+    # other languages these repos actually use
+    assert "handler (line 1)" in file_symbols("export function handler() {}\n")
+    assert "Config (line 1)" in file_symbols("type Config struct {\n}\n")
+    assert "parse (line 1)" in file_symbols("pub fn parse(s: &str) {}\n")
+    assert file_symbols("") == []
+
+
+def test_symbol_outline_lands_in_the_prompt_before_the_diff():
+    from scripts.review_pr import build_prompt, build_symbol_outline, changed_paths
+
+    diff = (
+        "diff --git a/job_board/classifier.py b/job_board/classifier.py\n"
+        "--- a/job_board/classifier.py\n+++ b/job_board/classifier.py\n"
+        "@@ -1,2 +1,3 @@\n+x = 1\n"
+    )
+    assert changed_paths(diff) == ["job_board/classifier.py"]
+
+    outline = build_symbol_outline({"job_board/classifier.py": "def clean_space(v):\n    pass\n"})
+    assert outline == "job_board/classifier.py: clean_space (line 1)"
+
+    p = build_prompt("DIFF", conventions="rules", symbol_outline=outline)
+    assert "clean_space (line 1)" in p
+    assert p.index("clean_space") < p.index("DIFF")  # the reviewer sees it before judging
+    assert "do not report" in p  # the instruction is what actually stops the false positive
+    assert "Top-level symbols" not in build_prompt("DIFF", conventions="rules")  # optional
+
+
 def test_run_feeds_pr_text_to_model():
     # run() must pass the PR title+body so the reviewer can check intent vs code.
     import scripts.review_pr as rp
@@ -379,7 +513,7 @@ def test_run_feeds_pr_text_to_model():
     # `u` is a per-model prompt builder now — resolve it the way complete() would.
     rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, marker, body: None
-    rp.gh.get_file_text = lambda repo, path: ""
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
     rp.reconcile_inline = lambda *a, **k: None
     rp.repo_context.ensure_fresh = lambda repo: ""
     try:
@@ -410,7 +544,7 @@ def test_run_feeds_project_context_to_model():
     # `u` is a per-model prompt builder now — resolve it the way complete() would.
     rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, marker, body: None
-    rp.gh.get_file_text = lambda repo, path: ""
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
     rp.reconcile_inline = lambda *a, **k: None
     rp.repo_context.ensure_fresh = lambda repo: "PROJECT DOES Y"
     try:
@@ -607,7 +741,7 @@ def test_review_incremental():
     # `u` is a per-model prompt builder now — resolve it the way complete() would.
     rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, m, body: bodies.append(body)
-    rp.gh.get_file_text = lambda repo, path: ""
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
     rp.reconcile_inline = lambda repo, n, s, anch, scope=None: scopes.append(scope)
     rp.gh.compare_diff = lambda repo, base, head: _block("changed.py", "+delta\n")
     rp.repo_context.ensure_fresh = lambda repo: ""
@@ -729,7 +863,7 @@ def test_blockers():
 
 
 def test_merge_gating():
-    # run() must refuse to merge while any gate fails (dirty state, unresolved
+    # C7: run() must refuse to merge while any gate fails (dirty state, unresolved
     # threads) and squash-merge only when all gates are clean.
     import scripts.merge_pr as mp
 
@@ -780,6 +914,11 @@ def test_merge_gating():
 if __name__ == "__main__":
     test_missing_sections()
     test_labels_for()
+    test_kind_from_title()
+    test_kind_from_diff_only_speaks_when_the_shape_is_clear()
+    test_kind_from_branch()
+    test_desired_labels_prefers_the_title_over_the_diff()
+    test_desired_labels_falls_back_to_branch_then_triage()
     test_summarize_empty()
     test_summarize_gating()
     test_review_gating()
@@ -795,6 +934,8 @@ if __name__ == "__main__":
     test_complete_json_mode()
     test_build_prompt_includes_pr_text()
     test_build_prompt_includes_project_context()
+    test_file_symbols_finds_helpers_defined_outside_the_diff()
+    test_symbol_outline_lands_in_the_prompt_before_the_diff()
     test_run_feeds_pr_text_to_model()
     test_run_feeds_project_context_to_model()
     test_react_wiring()

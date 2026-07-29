@@ -11,6 +11,8 @@ import urllib.request
 
 from github import Auth, Github
 
+from scripts.config import DEFAULT_LABEL_COLOR, LABEL_COLORS
+
 _API = "https://api.github.com"
 log = logging.getLogger("sidekick-cat.gh")
 
@@ -83,12 +85,18 @@ def get_repo():
     return Github(os.environ["GH_TOKEN"]).get_repo(os.environ["GITHUB_REPOSITORY"])
 
 
-def get_file_text(repo, path):
-    """Default-branch contents of `path` as text, or None if absent. Best-effort —
-    used to feed the target repo's CLAUDE.md to the reviewer (no local checkout on
-    Cloud Run)."""
+def get_file_text(repo, path, ref=None):
+    """Contents of `path` as text, or None if absent. Best-effort — used to feed the
+    target repo's CLAUDE.md to the reviewer (no local checkout on Cloud Run).
+
+    `ref` defaults to the default branch. Pass the PR head sha when reading a file the
+    PR itself touches: a helper the PR adds doesn't exist on the default branch yet, so
+    reading without a ref would report it missing — which is the exact mistake we're
+    giving the reviewer this data to stop making."""
     try:
-        return repo.get_contents(path).decoded_content.decode("utf-8", errors="replace")
+        kwargs = {"ref": ref} if ref else {}
+        contents = repo.get_contents(path, **kwargs)
+        return contents.decoded_content.decode("utf-8", errors="replace")
     except Exception:
         return None  # dev-note: missing file / dir / binary → just review without it
 
@@ -157,11 +165,18 @@ def set_managed_labels(repo, pr_number, desired, managed):
     current = {lbl.name for lbl in issue.get_labels()}
     add = [n for n in desired if n not in current]
     remove = [n for n in managed if n in current and n not in desired]
-    for name in add:  # create any label that doesn't exist yet, so setup is zero-config
+    for name in desired:  # create any label that doesn't exist yet, so setup is zero-config
+        color = LABEL_COLORS.get(name, DEFAULT_LABEL_COLOR)
         try:
-            repo.get_label(name)
+            label = repo.get_label(name)
         except Exception:
-            repo.create_label(name=name, color="ededed")
+            repo.create_label(name=name, color=color)
+            continue
+        # Repaint only labels still wearing the old default grey: that means the bot made
+        # them and nobody has recolored them since, so every repo self-heals on its next
+        # PR. A color a human picked is left alone.
+        if label.color == DEFAULT_LABEL_COLOR != color:
+            label.edit(name=name, color=color)
     if add:
         issue.add_to_labels(*add)
     for name in remove:

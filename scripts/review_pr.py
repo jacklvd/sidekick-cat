@@ -13,6 +13,7 @@ GH_TOKEN. PR number = the triggering comment's issue.
 
 import json
 import os
+import re
 from pathlib import Path
 
 from scripts import gh, limits, repo_context
@@ -23,8 +24,10 @@ from scripts.config import (
     MODEL_INPUT_CHARS,
     MODELS,
     REVIEW_LARGE_DIFF_CHARS,
+    REVIEW_SYMBOL_FILES,
+    REVIEW_SYMBOLS_PER_FILE,
 )
-from scripts.diff_anchors import anchors, number_diff, strip_noise
+from scripts.diff_anchors import anchors, block_path, file_blocks, number_diff, strip_noise
 from scripts.llm_client import complete, truncate_diff
 
 _INLINE_MARKER = "bot:review-inline"
@@ -82,19 +85,78 @@ _SYSTEM = (
 _CONVENTIONS = Path("CLAUDE.md")  # repo house rules, fed to the reviewer when present
 
 
+# Top-level declarations across the languages these repos actually use. Anchored at
+# column 0 on purpose: a nested def isn't the file's surface, it's noise. `const`/`let`
+# catch the JS/TS `export const foo = () => {}` idiom, which is a definition in practice.
+# dev-note: regex, not a parser — it misses Go methods (`func (r *T) Name()`, whose
+# receiver breaks the identifier match) and anything exotic. That's fine: an extra symbol
+# costs a few tokens and a missed one just restores today's behavior. Reach for a real
+# parser (tree-sitter) only if reviewers start citing symbols this doesn't see.
+_SYMBOL_RE = re.compile(
+    r"^(?:export\s+)?(?:default\s+)?(?:public\s+|private\s+|protected\s+|pub\s+)?"
+    r"(?:static\s+)?(?:async\s+)?"
+    r"(?:def|class|func|fn|function|type|struct|interface|trait|enum|const|let|var)\s+"
+    r"([A-Za-z_$][\w$]*)",
+    re.MULTILINE,
+)
+
+
+def file_symbols(text: str, limit: int = REVIEW_SYMBOLS_PER_FILE) -> list[str]:
+    """`name (line N)` for each top-level declaration in a source file.
+
+    The reviewer only ever sees the diff, so anything defined outside the changed hunks
+    is invisible to it — and it reads that absence as a defect. A real review of this bot
+    flagged `clean_space` as "not imported or defined" when the helper sat 120 lines above
+    the hunk, unchanged and therefore absent from the diff. This is the cheap fix: names
+    and line numbers only, no bodies, so a whole file costs a few dozen tokens.
+    """
+    out = []
+    for match in _SYMBOL_RE.finditer(text or ""):
+        line = text.count("\n", 0, match.start()) + 1
+        out.append(f"{match.group(1)} (line {line})")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def changed_paths(diff: str, limit: int = REVIEW_SYMBOL_FILES) -> list[str]:
+    """Paths the diff touches, in order, deduped and capped."""
+    seen: list[str] = []
+    for block in file_blocks(diff):
+        path = block_path(block)
+        if path and path not in seen:
+            seen.append(path)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def build_symbol_outline(files: dict[str, str]) -> str:
+    """Render `path -> top-level symbols` for the files the diff touches."""
+    parts = []
+    for path, text in files.items():
+        symbols = file_symbols(text)
+        if symbols:
+            parts.append(f"{path}: " + ", ".join(symbols))
+    return "\n".join(parts)
+
+
 def build_prompt(
     diff: str,
     conventions: str | None = None,
     max_chars: int = MAX_DIFF_CHARS,
     pr_text: str | None = None,
     project_context: str | None = None,
+    symbol_outline: str | None = None,
 ) -> str:
     """Compose the review prompt. `conventions` is the target repo's CLAUDE.md text
     (Cloud Run fetches it via API); when None, fall back to a local file (Actions).
     `project_context` is the cached repo-context doc (scripts.repo_context) — what
     the rest of the project looks like, so the reviewer isn't judging the diff in a
     vacuum. `pr_text` is the PR title+body — what the change CLAIMS to do, so the
-    reviewer can flag code that contradicts its own description. `max_chars` caps
+    reviewer can flag code that contradicts its own description. `symbol_outline` is
+    what each changed file *already* defines outside the hunks, so the reviewer stops
+    reporting existing helpers as undefined (see file_symbols). `max_chars` caps
     the diff — larger on the high-TPM large-PR path."""
     if conventions is None and _CONVENTIONS.exists():
         conventions = _CONVENTIONS.read_text(encoding="utf-8")
@@ -105,6 +167,13 @@ def build_prompt(
         parts.append("Project context:\n" + project_context[:CONTEXT_MAX_TREE_CHARS])
     if pr_text:
         parts.append("PR title and description (what the author says it does):\n" + pr_text)
+    if symbol_outline:
+        parts.append(
+            "Top-level symbols already defined in the changed files (name and line, at "
+            "this PR's head). The diff shows you only the changed lines, so a helper "
+            "listed here EXISTS even when you cannot see its definition — do not report "
+            "it as missing, undefined, or unimported:\n" + symbol_outline
+        )
     parts.append("PR diff:\n" + truncate_diff(diff, max_chars))
     return "\n\n".join(parts)
 
@@ -243,6 +312,16 @@ def run(repo, pr_number, diff):
     conventions = gh.get_file_text(repo, "CLAUDE.md") or ""  # target repo's rubric
     project_context = repo_context.ensure_fresh(repo)
     pr_text = f"{pr.title}\n\n{pr.body or ''}".strip()
+    # What the changed files already define outside the hunks. Read at head_sha, not the
+    # default branch: a helper this PR itself adds doesn't exist on the default branch, and
+    # reporting it missing is the very mistake the outline exists to prevent.
+    outline = build_symbol_outline(
+        {
+            path: text
+            for path in changed_paths(diff)
+            if (text := gh.get_file_text(repo, path, ref=head_sha))
+        }
+    )
     used: list = []  # complete() appends the (provider, model) that answered
     # Numbered BEFORE truncation so the prefixes always match the real file lines.
     numbered = number_diff(diff)
@@ -252,7 +331,7 @@ def run(repo, pr_number, diff):
         # their own budget; the Groq/GitHub fallbacks keep the tier cap they were
         # TPM-tuned for. Same diff, different truncation point.
         cap = MODEL_INPUT_CHARS.get(model, max_chars)
-        return build_prompt(numbered, conventions, cap, pr_text, project_context)
+        return build_prompt(numbered, conventions, cap, pr_text, project_context, outline)
 
     raw = complete(_SYSTEM, prompt_for, task, json_mode=True, used=used)
 

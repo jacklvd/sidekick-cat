@@ -168,6 +168,18 @@ MODEL_INPUT_CHARS = {
 # finish_reason='length', it needs more room, not a smaller diff.
 PROVIDER_MAX_TOKENS = {"nvidia": 8000, "groq": 4000}
 
+# Symbol outline: the top-level names each changed file already defines, fetched at the
+# PR head and folded into the review prompt. The reviewer only ever sees the diff, so a
+# helper defined outside the changed hunks is invisible to it — and it reports that
+# absence as a defect (a real review of this bot called `clean_space` "not imported or
+# defined" when it sat 120 lines above the hunk). Names + line numbers only, no bodies,
+# so a file costs a few dozen tokens. Costs one contents-API call per changed file, capped
+# here. dev-note: the cap means a PR touching more than REVIEW_SYMBOL_FILES files outlines
+# only the first few — the long tail is where this matters least (a 40-file PR is already
+# being skimmed), so it isn't worth the extra calls.
+REVIEW_SYMBOL_FILES = 12
+REVIEW_SYMBOLS_PER_FILE = 60
+
 # Deterministic PR-open.
 # Sections the PR description must contain (matched as line-leading headings,
 # case-insensitive). "TL;DR" (no trailing colon) so both "## TL;DR" and
@@ -180,6 +192,55 @@ LABEL_RULES = {
     "*.md": "documentation",
     "docs/*": "documentation",
     ".github/*": "github-actions",
+}
+
+# Conventional-commit type -> label, for the *kind* of change (the path rules above only
+# say which language it touched). The title is the signal because it is the author stating
+# their intent outright; the diff can only be read for it, and reads badly. A bugfix
+# usually *adds* lines (a guard, a validation) and a cleanup usually removes them, so
+# "mostly deletions" means "fix" far less often than it looks — this repo's own
+# `fix: survive Groq's July 17 decommission` was net +180/-24.
+# Names match GitHub's defaults where they exist, so most repos already have them
+# (gh.set_managed_labels creates any that don't, colored from LABEL_COLORS).
+KIND_LABELS = {
+    "feat": "enhancement",
+    "feature": "enhancement",
+    "fix": "bug",
+    "bugfix": "bug",
+    "hotfix": "bug",
+    "refactor": "refactor",
+    "perf": "refactor",
+    "style": "refactor",
+    "docs": "documentation",
+    "test": "tests",
+    "tests": "tests",
+    "chore": "chore",
+    "build": "chore",
+    "ci": "chore",
+    "revert": "chore",
+}
+
+# Last resort when neither the title, the branch, nor the diff says what kind of change
+# this is (typical of an outside collaborator: "Update the scraper filter" on `patch-1`).
+# A human triaging is cheaper than a wrong guess, and the label says exactly that.
+TRIAGE_LABEL = "needs-triage"
+
+# Hex colors (no leading #) for labels the bot creates. GitHub's own defaults for the
+# names it ships with, linguist's language color for `python`; the rest picked to keep
+# the two axes visually distinct — path labels cool, kind labels warm. Anything without an
+# entry gets DEFAULT_LABEL_COLOR, which also doubles as "the bot painted this, and nobody
+# has repainted it" — gh.set_managed_labels only recolors labels still wearing it.
+DEFAULT_LABEL_COLOR = "ededed"
+LABEL_COLORS = {
+    "python": "3572a5",
+    "documentation": "0075ca",
+    "github-actions": "2088ff",
+    "enhancement": "a2eeef",
+    "bug": "d73a4a",
+    "refactor": "fbca04",
+    "tests": "0e8a16",
+    "chore": "cfd3d7",
+    TRIAGE_LABEL: "e4e669",
 }
 
 # /review command.
