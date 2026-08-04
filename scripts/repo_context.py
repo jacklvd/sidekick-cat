@@ -8,8 +8,9 @@ source files (docstrings + imports show what calls what). One LLM call (task
 "context", NVIDIA GLM-first — the brief is folded into every
 review prompt, so it gets the strong tier; large-context models also see a much
 bigger tree, see config.MODEL_INPUT_CHARS). Refreshed manually via /context or
-lazily by /review when missing or older than CONTEXT_REFRESH_DAYS — staleness
-reads the issue's own `updated_at`, no separate bookkeeping needed.
+lazily by /review when missing, older than CONTEXT_REFRESH_DAYS, or with
+CONTEXT_REFRESH_PRS PRs merged since — staleness reads the issue's own
+`updated_at` and GitHub's merge times, no separate bookkeeping needed.
 """
 
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from scripts.config import (
     CONTEXT_KEY_FILES,
     CONTEXT_MAX_TREE_CHARS,
     CONTEXT_REFRESH_DAYS,
+    CONTEXT_REFRESH_PRS,
     MODEL_INPUT_CHARS,
     NOISE_GLOBS,
 )
@@ -35,10 +37,10 @@ _TITLE = "🐱 Sidekick project context (auto-generated, do not edit)"
 # at CONTEXT_MAX_TREE_CHARS — a longer brief would be cut mid-sentence downstream.
 #
 # The grounding rules below matter more here than in a one-shot repo explainer, and are
-# adapted from one (BaoNguyen09/repo-explainer). This brief is cached for
-# CONTEXT_REFRESH_DAYS and folded into *every* review in that window, so one invented
+# adapted from one (BaoNguyen09/repo-explainer). This brief is cached until the next
+# refresh and folded into *every* review in that window, so one invented
 # "purpose" or made-up convention doesn't mislead a reader once — it makes the reviewer
-# post confident, wrong blockers on every PR for a month. An honest "unclear" costs a
+# post confident, wrong blockers on every PR until it expires. An honest "unclear" costs a
 # reviewer nothing; a confident hallucination costs it its credibility.
 # dev-note: deliberately NOT copying that project's output format (mermaid diagram,
 # re-printed file tree, ~1500 words). It targets a human reading a page; this brief is
@@ -127,9 +129,14 @@ def build_context_prompt(tree_text: str, key_files: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
-def is_stale(issue) -> bool:
-    """True if there's no issue yet, or it hasn't been refreshed in CONTEXT_REFRESH_DAYS."""
+def is_stale(issue, merged_prs: int = 0) -> bool:
+    """True if there's no issue yet, it hasn't been refreshed in CONTEXT_REFRESH_DAYS,
+    or CONTEXT_REFRESH_PRS PRs have merged since it was (`merged_prs`) — whichever
+    trips first. Age alone lets a shipped refactor leave the brief wrong for the rest
+    of the window; the PR count catches exactly that, and stays quiet on idle repos."""
     if issue is None:
+        return True
+    if merged_prs >= CONTEXT_REFRESH_PRS:
         return True
     age = datetime.now(timezone.utc) - issue.updated_at
     return age.days >= CONTEXT_REFRESH_DAYS
@@ -144,7 +151,7 @@ def run(repo) -> "str | None":
     """Generate + cache the project-context doc. Returns the body, or None if
     rate-limited or the model didn't return usable content. Host-agnostic core.
     Gated on a repo-scoped pseudo-PR key ("context"), not the triggering PR's own
-    bucket — this is a once-a-month repo-level refresh, not part of any single
+    bucket — this is an occasional repo-level refresh, not part of any single
     PR's review budget, so it shouldn't silently halve that PR's daily cap."""
     ok, _ = limits.allow_llm_call(repo.full_name, "context")
     if not ok:
@@ -179,8 +186,10 @@ def ensure_fresh(repo) -> str:
     """Context text for /review to include: reuse if fresh, else refresh (falling
     back to a stale-but-present doc, then "" if generation fails). Never raises."""
     issue = gh.get_context_issue(repo, _MARKER)
-    if issue is not None and not is_stale(issue):
-        return _strip_marker(issue.body or "")
+    if issue is not None:
+        merged = gh.merged_since(repo, issue.updated_at, CONTEXT_REFRESH_PRS)
+        if not is_stale(issue, merged):
+            return _strip_marker(issue.body or "")
     fresh = run(repo)
     if fresh is not None:
         return fresh

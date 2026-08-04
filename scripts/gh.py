@@ -313,6 +313,28 @@ def get_tree(repo) -> list[tuple[str, int]]:
         return []
 
 
+def merged_since(repo, since, limit):
+    """How many PRs merged after `since`, counted up to `limit` (callers only ever
+    ask "is it N or more?"). Stateless: no counter to keep in sync — GitHub already
+    records merge times, and repo_context's cache issue already records its own.
+    Scans closed PRs newest-*updated* first and stops at the first one untouched
+    since `since` — anything merged after `since` was also updated after it, so the
+    scanned window is a superset. Best-effort: an API hiccup yields 0 (age-based
+    staleness still applies) rather than breaking a review."""
+    n = 0
+    try:
+        for pr in repo.get_pulls(state="closed", sort="updated", direction="desc"):
+            if pr.updated_at < since:
+                break
+            if pr.merged_at is not None and pr.merged_at > since:
+                n += 1
+                if n >= limit:
+                    break
+    except Exception:
+        return n
+    return n
+
+
 def get_context_issue(repo, marker):
     """The bot's existing hidden-marker issue (open or closed), or None. Requires
     the issue to be bot-authored — marker text alone isn't authorization, since

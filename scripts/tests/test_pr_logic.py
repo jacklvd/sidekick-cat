@@ -254,6 +254,7 @@ def test_build_context_prompt():
 def test_is_stale():
     from datetime import datetime, timedelta, timezone
 
+    from scripts.config import CONTEXT_REFRESH_PRS
     from scripts.repo_context import is_stale
 
     class FakeIssue:
@@ -263,6 +264,43 @@ def test_is_stale():
     assert is_stale(None) is True
     assert is_stale(FakeIssue(1)) is False
     assert is_stale(FakeIssue(31)) is True
+    # young issue goes stale once enough PRs have merged behind it
+    assert is_stale(FakeIssue(1), CONTEXT_REFRESH_PRS - 1) is False
+    assert is_stale(FakeIssue(1), CONTEXT_REFRESH_PRS) is True
+
+
+def test_merged_since():
+    from datetime import datetime, timedelta, timezone
+
+    from scripts.gh import merged_since
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=2)
+
+    class FakePR:
+        def __init__(self, updated_days, merged_days):
+            self.updated_at = now - timedelta(days=updated_days)
+            self.merged_at = None if merged_days is None else now - timedelta(days=merged_days)
+
+    class FakeRepo:
+        def __init__(self, prs):
+            self.prs = prs
+
+        def get_pulls(self, state, sort, direction):
+            return self.prs
+
+    # newest-updated first: 2 merged inside the window, then a closed-unmerged one,
+    # then an older PR that stops the scan (a later merge can't hide behind it).
+    prs = [FakePR(0, 0), FakePR(1, 1), FakePR(1, None), FakePR(9, 9)]
+    assert merged_since(FakeRepo(prs), since, 3) == 2
+    assert merged_since(FakeRepo(prs), since, 1) == 1  # stops at the cap
+    assert merged_since(FakeRepo([FakePR(9, 9)]), since, 3) == 0
+
+    class BoomRepo:
+        def get_pulls(self, state, sort, direction):
+            raise RuntimeError("API down")
+
+    assert merged_since(BoomRepo(), since, 3) == 0  # degrades to age-only staleness
 
 
 def test_repo_context_run_and_ensure_fresh():
@@ -1552,6 +1590,7 @@ if __name__ == "__main__":
     test_pick_head_files()
     test_build_context_prompt()
     test_is_stale()
+    test_merged_since()
     test_repo_context_run_and_ensure_fresh()
     test_anchors()
     test_strip_noise()

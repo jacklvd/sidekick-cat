@@ -279,7 +279,11 @@ AUTO_APPROVE = False
 # Repo project context for /review. Cached as a GitHub Issue (bot:context),
 # refreshed manually (/context) or lazily by /review when missing/stale.
 TRIGGER_CONTEXT = "/context"
-CONTEXT_REFRESH_DAYS = 30
+CONTEXT_REFRESH_DAYS = 15
+# …or sooner on an active repo: a few merged PRs can invalidate the brief long
+# before the clock does (one big refactor ships and the "Layout" section is wrong).
+# Whichever trips first wins — the clock covers quiet repos, this covers busy ones.
+CONTEXT_REFRESH_PRS = 3
 CONTEXT_MAX_TREE_CHARS = 6000
 CONTEXT_KEY_FILES = [
     "README.md", "CLAUDE.md", "pyproject.toml", "package.json",
