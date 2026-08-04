@@ -25,10 +25,18 @@ GITHUB_APP_PERMISSIONS = [
     ("Contents", "Read and write", "reads files/tree/diffs; squash-merges and deletes the branch"),
     ("Issues", "Read and write", "PR comments, labels, assignees, and the bot:context cache issue"),
     ("Pull requests", "Read and write", "reads the diff, posts inline review comments, submits reviews"),
+    ("Checks", "Read and write", "the Sidekick check run carrying the review verdict"),
     ("Metadata", "Read-only", "mandatory default for every GitHub App"),
 ]
 
-GITHUB_APP_WEBHOOK_EVENTS = ["Pull request", "Issue comment"]
+# dev-note: the last two are easy to skip and fail silently — without them the bot
+# simply never answers a thread reply and never re-checks a resolved thread.
+GITHUB_APP_WEBHOOK_EVENTS = [
+    "Pull request",
+    "Issue comment",
+    "Pull request review comment",
+    "Pull request review thread",
+]
 
 _ENV_KEYS = ["APP_ID", "APP_KEY", "WEBHOOK_SECRET", "NVIDIA_API_KEY", "GROQ_API_KEY", "MODELS_PAT"]
 
