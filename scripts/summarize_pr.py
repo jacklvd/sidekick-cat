@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 from scripts import gh, limits
+from scripts.config import ICON, ICON_HMM
 from scripts.llm_client import complete, truncate_diff
 
 _SYSTEM = (
@@ -36,10 +37,10 @@ def run(repo, pr_number, diff):
         if not ok:
             gh.upsert_comment(
                 repo, pr_number, "bot:ratelimit",
-                f"🐱 Sidekick is taking a breather — {reason}. Try again later.",
+                f"{ICON_HMM} Sidekick is taking a breather — {reason}. Try again later.",
             )
             return
-    body = "### 🐱 Sidekick's summary\n" + summarize(diff)
+    body = f"### {ICON} Sidekick's summary\n" + summarize(diff)
     gh.upsert_comment(repo, pr_number, "bot:summary", body)
 
 

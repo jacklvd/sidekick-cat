@@ -12,29 +12,48 @@ GH_TOKEN. PR number = the triggering comment's issue.
 """
 
 import json
+import logging
 import os
+import re
 from pathlib import Path
 
 from scripts import gh, limits, repo_context
 from scripts.config import (
     AUTO_APPROVE,
     CONTEXT_MAX_TREE_CHARS,
+    ICON,
+    ICON_HMM,
     MAX_DIFF_CHARS,
     MODEL_INPUT_CHARS,
     MODELS,
+    REVIEW_FILE_MAX_CHARS,
     REVIEW_LARGE_DIFF_CHARS,
+    REVIEW_SYMBOL_FILES,
+    REVIEW_SYMBOLS_PER_FILE,
 )
-from scripts.diff_anchors import anchors, number_diff, strip_noise
-from scripts.llm_client import complete, truncate_diff
+from scripts.diff_anchors import anchors, block_path, file_blocks, number_diff, strip_noise
+from scripts.llm_client import complete, failed, truncate_diff
+
+log = logging.getLogger("sidekick-cat")  # shares the server's log stream
 
 _INLINE_MARKER = "bot:review-inline"
+
+# Note appended to a stale thread root that has replies (see _resolved_note): we edit
+# rather than delete so the human's reply isn't orphaned. prior_issues_text keys on this
+# to stop re-feeding an already-resolved root as a "still-open" issue.
+_RESOLVED_NOTE = f"_{ICON} The latest review no longer flags this._"
 
 # Friendly display names for review models — config's ids are ugly for user copy.
 _MODEL_LABELS = {
     "z-ai/glm-5.2": "GLM-5.2",
+    "nvidia/nemotron-3-ultra-550b-a55b": "Nemotron-3-Ultra",
+    "deepseek-ai/deepseek-v4-pro": "DeepSeek-V4-Pro",
     "minimaxai/minimax-m2.7": "MiniMax-M2.7",
-    "meta-llama/llama-4-scout-17b-16e-instruct": "Llama-4 Scout",
-    "groq/compound": "Groq Compound",
+    "mistralai/mistral-medium-3.5-128b": "Mistral-Medium-3.5",
+    "qwen/qwen3.5-122b-a10b": "Qwen3.5-122B",
+    "qwen/qwen3.6-27b": "Qwen3.6-27B",
+    "openai/gpt-oss-120b": "GPT-OSS-120B",
+    "openai/gpt-4.1": "GPT-4.1",
 }
 
 
@@ -44,11 +63,10 @@ def _large_note(model: str) -> str:
     Falls back to the tier's primary label when the responder is unknown."""
     label = _MODEL_LABELS.get(model, model)
     return (
-        f"> 🐱 Big PR — I reviewed the whole diff in one pass with **{label}**. "
+        f"> {ICON} Big PR — I reviewed the whole diff in one pass with **{label}**. "
         "Treat it as a wide first sweep; split the PR and `/review` again for a "
         "closer look.\n\n"
     )
-
 
 _SYSTEM = (
     "You are a meticulous senior software engineer code reviewer. Review only the changes in the diff, "
@@ -78,20 +96,110 @@ _SYSTEM = (
 _CONVENTIONS = Path("CLAUDE.md")  # repo house rules, fed to the reviewer when present
 
 
+# Top-level declarations across the languages these repos actually use. Anchored at
+# column 0 on purpose: a nested def isn't the file's surface, it's noise. `const`/`let`
+# catch the JS/TS `export const foo = () => {}` idiom, which is a definition in practice.
+# dev-note: regex, not a parser — it misses Go methods (`func (r *T) Name()`, whose
+# receiver breaks the identifier match) and anything exotic. That's fine: an extra symbol
+# costs a few tokens and a missed one just restores today's behavior. Reach for a real
+# parser (tree-sitter) only if reviewers start citing symbols this doesn't see.
+_SYMBOL_RE = re.compile(
+    r"^(?:export\s+)?(?:default\s+)?(?:public\s+|private\s+|protected\s+|pub\s+)?"
+    r"(?:static\s+)?(?:async\s+)?"
+    r"(?:def|class|func|fn|function|type|struct|interface|trait|enum|const|let|var)\s+"
+    r"([A-Za-z_$][\w$]*)",
+    re.MULTILINE,
+)
+
+
+def file_symbols(text: str, limit: int = REVIEW_SYMBOLS_PER_FILE) -> list[str]:
+    """`name (line N)` for each top-level declaration in a source file.
+
+    The reviewer only ever sees the diff, so anything defined outside the changed hunks
+    is invisible to it — and it reads that absence as a defect. A real review of this bot
+    flagged `clean_space` as "not imported or defined" when the helper sat 120 lines above
+    the hunk, unchanged and therefore absent from the diff. This is the cheap fix: names
+    and line numbers only, no bodies, so a whole file costs a few dozen tokens.
+    """
+    out = []
+    for match in _SYMBOL_RE.finditer(text or ""):
+        line = text.count("\n", 0, match.start()) + 1
+        out.append(f"{match.group(1)} (line {line})")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def changed_paths(diff: str, limit: int = REVIEW_SYMBOL_FILES) -> list[str]:
+    """Paths the diff touches, in order, deduped and capped."""
+    seen: list[str] = []
+    for block in file_blocks(diff):
+        path = block_path(block)
+        if path and path not in seen:
+            seen.append(path)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def build_symbol_outline(files: dict[str, str]) -> str:
+    """Render `path -> top-level symbols` for the files the diff touches."""
+    parts = []
+    for path, text in files.items():
+        symbols = file_symbols(text)
+        if symbols:
+            parts.append(f"{path}: " + ", ".join(symbols))
+    return "\n".join(parts)
+
+
+def build_file_contents(
+    files: dict[str, str], max_chars: int, per_file_max: int = REVIEW_FILE_MAX_CHARS
+) -> str:
+    """Full, line-numbered text of the changed files, in diff order — what the symbol
+    outline can only name. For large-context models only (see run.prompt_for): the
+    reviewer sees callers, error paths, and surrounding conventions, not just the hunk.
+
+    Files that don't fit are dropped whole, never sliced: a half-file is worse than an
+    absent one (the reviewer reads a cut-off body as a defect). A file over per_file_max
+    is skipped outright — it's almost certainly generated. Returns "" when nothing fits."""
+    parts, size = [], 0
+    for path, text in files.items():
+        if not text or len(text) > per_file_max:
+            continue
+        numbered = "\n".join(
+            f"{i}| {line}" for i, line in enumerate(text.splitlines(), 1)
+        )
+        block = f"{path}:\n{numbered}"
+        if size + len(block) > max_chars:
+            break
+        parts.append(block)
+        size += len(block)
+    return "\n\n".join(parts)
+
+
 def build_prompt(
     diff: str,
     conventions: str | None = None,
     max_chars: int = MAX_DIFF_CHARS,
     pr_text: str | None = None,
     project_context: str | None = None,
+    symbol_outline: str | None = None,
+    file_contents: str | None = None,
+    prior_issues: str | None = None,
 ) -> str:
     """Compose the review prompt. `conventions` is the target repo's CLAUDE.md text
     (Cloud Run fetches it via API); when None, fall back to a local file (Actions).
     `project_context` is the cached repo-context doc (scripts.repo_context) — what
     the rest of the project looks like, so the reviewer isn't judging the diff in a
     vacuum. `pr_text` is the PR title+body — what the change CLAIMS to do, so the
-    reviewer can flag code that contradicts its own description. `max_chars` caps
-    the diff — larger on the high-TPM large-PR path."""
+    reviewer can flag code that contradicts its own description. `symbol_outline` is
+    what each changed file *already* defines outside the hunks, so the reviewer stops
+    reporting existing helpers as undefined (see file_symbols). `file_contents` is the
+    full, line-numbered text of changed files — for large-budget models only, so the
+    reviewer sees callers, error paths, and surrounding conventions. `prior_issues` is
+    the still-open issues from the previous review, so an incremental re-review can
+    confirm fixes instead of re-discovering them. `max_chars` caps the diff — larger
+    on the high-TPM large-PR path."""
     if conventions is None and _CONVENTIONS.exists():
         conventions = _CONVENTIONS.read_text(encoding="utf-8")
     parts = []
@@ -101,6 +209,26 @@ def build_prompt(
         parts.append("Project context:\n" + project_context[:CONTEXT_MAX_TREE_CHARS])
     if pr_text:
         parts.append("PR title and description (what the author says it does):\n" + pr_text)
+    if symbol_outline:
+        parts.append(
+            "Top-level symbols already defined in the changed files (name and line, at "
+            "this PR's head). The diff shows you only the changed lines, so a helper "
+            "listed here EXISTS even when you cannot see its definition — do not report "
+            "it as missing, undefined, or unimported:\n" + symbol_outline
+        )
+    if file_contents:
+        parts.append(
+            "Full contents of the changed files at this PR's head, line-numbered. Use "
+            "them to judge callers, error paths, and the conventions around each hunk — "
+            "but only raise issues on lines the diff actually changed:\n" + file_contents
+        )
+    if prior_issues:
+        parts.append(
+            "Issues you flagged on the previous review that are still open. If the new "
+            "changes fix one, do NOT report it again; if it is still present, report it "
+            "at its current line. In your summary, say how many of these the new changes "
+            "addressed:\n" + prior_issues
+        )
     parts.append("PR diff:\n" + truncate_diff(diff, max_chars))
     return "\n\n".join(parts)
 
@@ -158,28 +286,66 @@ def _inline_body(issue) -> str:
     return f"{prefix}{str(issue.get('body', '')).strip()}\n<!-- {_INLINE_MARKER} -->"
 
 
-def reconcile_inline(repo, pr_number, head_sha, anchorable, scope=None):
-    """Keep/edit matching comments, delete stale ones, create new ones. Keyed on
-    (path, line). Editing keeps the thread + its resolution state intact.
-    `scope` is the set of file paths this review actually looked at (incremental
-    runs); stale comments OUTSIDE it are kept — the model never re-judged them."""
+def _resolved_note(body: str) -> str:
+    """Append the "no longer flags this" note to a stale root, idempotently.
+    reconcile_inline then resolves the thread, so the note explains WHY it's resolved
+    — a visible trail rather than a delete that erased the evidence."""
+    text = body or ""
+    if _RESOLVED_NOTE in text:
+        return text
+    base = text.split(f"<!-- {_INLINE_MARKER} -->")[0].rstrip()
+    return f"{base}\n\n{_RESOLVED_NOTE}\n<!-- {_INLINE_MARKER} -->"
+
+
+def reconcile_inline(repo, pr_number, head_sha, anchorable, token, scope=None):
+    """Keep/edit matching comments, RESOLVE stale ones (not delete), create new ones.
+    Keyed on (path, line) over thread ROOTS only. `scope` is the set of file paths this
+    review actually looked at (incremental runs); stale roots OUTSIDE it are kept
+    untouched — the model never re-judged them.
+
+    A stale root (issue no longer flagged, in scope) is marked with a note and its
+    thread RESOLVED — a visible, collapsed trail out of the unresolved count, instead of
+    a `delete()` that erased the evidence. If a resolved thread's issue RECURS at the
+    same (path, line), the thread is un-resolved so the merge gate re-catches it.
+
+    Resolution is GraphQL, so `token` is required. `review_thread_state` degrades to {}
+    on failure, in which case resolve/unresolve are skipped (the note still lands) —
+    never destructive."""
+    tag = f"<!-- {_INLINE_MARKER} -->"
+    all_comments = gh.get_review_comments(repo, pr_number)
     existing = {
         (c.path, c.line): c
-        for c in gh.get_inline_comments(repo, pr_number, _INLINE_MARKER)
+        for c in all_comments
+        if tag in (c.body or "") and c.in_reply_to_id is None
     }
+    # {root databaseId -> (thread node id, is_resolved)}; c.id joins to databaseId.
+    threads = gh.review_thread_state(repo, pr_number, token)
     desired = {(it["path"], it["line"]): it for it in anchorable}
+
     for key, it in desired.items():
         body = _inline_body(it)
         c = existing.get(key)
         if c is None:
-            gh.create_review_comment(
-                repo, pr_number, head_sha, it["path"], it["line"], body
-            )
-        elif (c.body or "") != body:
-            c.edit(body)
+            gh.create_review_comment(repo, pr_number, head_sha, it["path"], it["line"], body)
+            continue
+        if (c.body or "") != body:
+            c.edit(body)  # clean issue body — overwrites any stale "no longer flags" note
+        # The issue recurred on a thread we'd resolved -> reopen so the gate counts it.
+        node_id, is_resolved = threads.get(c.id, (None, False))
+        if node_id is not None and is_resolved:
+            gh.unresolve_thread(token, node_id)
+
     for key, c in existing.items():
-        if key not in desired and (scope is None or key[0] in scope):
-            c.delete()  # issue no longer reported
+        if key in desired or (scope is not None and key[0] not in scope):
+            continue
+        # Stale root — issue no longer reported. Note WHY, then resolve (don't delete)
+        # so the trail survives. Idempotent: an already-resolved+noted thread no-ops.
+        new = _resolved_note(c.body or "")
+        if new != (c.body or ""):
+            c.edit(new)
+        node_id, is_resolved = threads.get(c.id, (None, False))
+        if node_id is not None and not is_resolved:
+            gh.resolve_thread(token, node_id)
 
 
 def _unanchorable_md(issues) -> str:
@@ -194,26 +360,43 @@ def _unanchorable_md(issues) -> str:
     return "\n".join(lines)
 
 
-def run(repo, pr_number, diff):
-    """Full /review, gated by head-SHA dedup + daily caps. Host-agnostic core."""
+def _clean_prior_body(body: str) -> str:
+    """Strip the inline marker and a leading `**[severity]**` prefix from a stored
+    comment body, leaving just the human-readable issue text for the prompt."""
+    text = (body or "").split(f"<!-- {_INLINE_MARKER} -->")[0].strip()
+    if text.startswith("**[") and "]**" in text:
+        text = text.split("]**", 1)[1].strip()
+    return " ".join(text.split())  # collapse newlines/whitespace to one line
+
+
+def prior_issues_text(comments, scope) -> str:
+    """The still-open inline issues from the previous review, so an incremental
+    re-review confirms fixes instead of re-discovering them. Thread ROOTS only
+    (a reply is not an issue), filtered to files in `scope` (the delta's files —
+    the model never re-judged anything outside it, so its old threads must not
+    appear as 'still open')."""
+    lines = []
+    for c in comments:
+        if getattr(c, "in_reply_to_id", None) is not None:
+            continue
+        if c.path not in scope:
+            continue
+        if _RESOLVED_NOTE in (c.body or ""):
+            continue  # already resolved-away (see _resolved_note) — not a still-open issue
+        lines.append(f"- {c.path}:{c.line} — {_clean_prior_body(c.body or '')}")
+    return "\n".join(lines)
+
+
+def run(repo, pr_number, diff, token=None):
+    """Full /review, gated by head-SHA dedup + daily caps. Host-agnostic core.
+    `token` is used only to resolve/un-resolve stale inline threads (GraphQL); every
+    real caller (dispatch, /review, Actions main) passes it. With None, reconcile still
+    edits/creates and notes stale threads — it just can't resolve them."""
     pr = repo.get_pull(pr_number)
     head_sha = pr.head.sha
     prev = limits.reviewed_head(repo.full_name, pr_number)
     if prev == head_sha:
-        return  # unchanged head already reviewed — re-review is free + idempotent
-    ok, reason = limits.allow_llm_call(repo.full_name, pr_number)
-    if not ok:
-        gh.upsert_comment(
-            repo,
-            pr_number,
-            "bot:ratelimit",
-            f"🐱 Sidekick is taking a breather — {reason}. Try again later.",
-        )
-        return
-    # dev-note: recorded before the review runs (parity with the old check-and-record
-    # seen_sha): if the LLM call dies mid-flight this head isn't retried until a new
-    # commit moves the sha — rare, bounded by PR_DAILY_MAX, acceptable.
-    limits.record_reviewed_head(repo.full_name, pr_number, head_sha)
+        return "done"  # unchanged head already reviewed — let the check settle to its verdict
 
     # Incremental: a previously reviewed PR only gets its NEW commits re-read —
     # cheaper, usually fits the smart tier, and untouched files keep their threads.
@@ -229,6 +412,25 @@ def run(repo, pr_number, diff):
     # Strip generated/vendored files BEFORE size-routing: a lock-file bump must not
     # push an otherwise small PR onto the broad-sweep large-model path.
     diff = strip_noise(diff)
+    if not diff.strip():
+        # Nothing reviewable survived — a lockfile/vendored-only push. Record the head
+        # so the next push compares from here, and stay silent: "nothing to review" on
+        # every dependency bump is noise the author never asked for.
+        limits.record_reviewed_head(repo.full_name, pr_number, head_sha)
+        return "done"  # nothing reviewable = clean; the head is recorded, the check settles
+
+    # Gate immediately before the model call. This is a cap on *LLM calls*, so the two
+    # GitHub reads above — which may legitimately find nothing to review — must not
+    # spend it. Auto-review makes that common: every dependency bump hits this path.
+    ok, reason = limits.allow_llm_call(repo.full_name, pr_number)
+    if not ok:
+        gh.upsert_comment(
+            repo,
+            pr_number,
+            "bot:ratelimit",
+            f"{ICON_HMM} Sidekick is taking a breather — {reason}. Try again later.",
+        )
+        return "failed"  # no review ran — the check goes neutral, not a false verdict
     # Size-route: small PRs go to the smart tier; big diffs to the high-TPM tier so
     # the whole thing fits one pass (and the large path may send a bigger diff). The
     # threshold is the small model's truncation cap — over it, qwen would truncate.
@@ -239,25 +441,76 @@ def run(repo, pr_number, diff):
     conventions = gh.get_file_text(repo, "CLAUDE.md") or ""  # target repo's rubric
     project_context = repo_context.ensure_fresh(repo)
     pr_text = f"{pr.title}\n\n{pr.body or ''}".strip()
+    # What the changed files already define outside the hunks. Read at head_sha, not the
+    # default branch: a helper this PR itself adds doesn't exist on the default branch, and
+    # reporting it missing is the very mistake the outline exists to prevent.
+    # Fetched once at head_sha: the outline names these files' symbols, and (for
+    # large-budget models) prompt_for folds in their full bodies. Same API calls,
+    # the text is no longer thrown away.
+    changed_files = {
+        path: text
+        for path in changed_paths(diff)
+        if (text := gh.get_file_text(repo, path, ref=head_sha))
+    }
+    outline = build_symbol_outline(changed_files)
     used: list = []  # complete() appends the (provider, model) that answered
     # Numbered BEFORE truncation so the prefixes always match the real file lines.
     numbered = number_diff(diff)
+
+    # On an incremental run, remind the model what it flagged last time so it confirms
+    # fixes instead of re-discovering (or silently dropping) them. Scoped to the delta's
+    # files — the model never re-judged anything outside them. set(anchors(diff)) is the
+    # delta's file set; uncapped, unlike changed_paths.
+    prior = ""
+    if incremental:
+        prior = prior_issues_text(
+            gh.get_inline_comments(repo, pr_number, _INLINE_MARKER), set(anchors(diff))
+        )
 
     def prompt_for(model: str) -> str:
         # Prompt sized per attempt: large-context models (NVIDIA) take the diff at
         # their own budget; the Groq/GitHub fallbacks keep the tier cap they were
         # TPM-tuned for. Same diff, different truncation point.
         cap = MODEL_INPUT_CHARS.get(model, max_chars)
-        return build_prompt(numbered, conventions, cap, pr_text, project_context)
+        # Full changed-file bodies only for large-budget rungs, and only in whatever
+        # cap the diff leaves free — a monster diff fills the budget and the outline
+        # still carries the cross-file signal. Small rungs never get bodies (no room).
+        files_text = None
+        if model in MODEL_INPUT_CHARS:
+            budget = max(0, cap - min(len(numbered), cap))
+            files_text = build_file_contents(changed_files, budget) or None
+        return build_prompt(
+            numbered, conventions, cap, pr_text, project_context, outline,
+            files_text, prior,
+        )
 
-    raw = complete(_SYSTEM, prompt_for, task, json_mode=True, used=used)
+    raw = complete(_SYSTEM, prompt_for, task, json_mode=True, used=used,
+                   rotate_key=hash((repo.full_name, pr_number)))
+    # Which rung actually answered — so a silent slide onto the fallbacks (NVIDIA quietly
+    # failing) shows up in the logs instead of only in slower/worse reviews.
+    log.info("review repo=%s pr=%s task=%s responder=%s",
+             repo.full_name, pr_number, task,
+             "/".join(used[0]) if used else "none")
+
+    # Record the head only once a model actually answered. complete() hands back a
+    # sentinel instead of raising (see llm_client.failed), so a quota/outage/oversize
+    # looks like a review by shape — and recording one would make the `prev == head_sha`
+    # return above permanent: that commit could never be reviewed again, not by /review,
+    # not by anything, because only a NEW sha clears it. A 15-minute breaker cooldown
+    # would silently strand every push it covered.
+    # dev-note: the old order recorded first, which also deduped two deliveries racing
+    # the same head. That race is now unguarded — cost is one duplicate review, and it's
+    # rare (delivery_seen drops webhook retries, and a push always moves the sha). A lost
+    # review is worse than a repeated one; revisit only if duplicates actually show up.
+    if not failed(raw):
+        limits.record_reviewed_head(repo.full_name, pr_number, head_sha)
 
     # Disclaimers built AFTER the call so the big-PR note names the model that
     # actually answered (falls back to the tier's primary if the call failed).
     note = _large_note(used[0][1] if used else MODELS[task][0][1]) if large else ""
     if incremental:
         note = (
-            f"> 🐱 Incremental review — only the changes since `{prev[:7]}`; "
+            f"> {ICON} Incremental review — only the changes since `{prev[:7]}`; "
             "earlier threads on untouched files were left as-is.\n\n"
         ) + note
 
@@ -266,9 +519,9 @@ def run(repo, pr_number, diff):
         # Fallback: model didn't return parseable JSON (quota msg, malformed) —
         # post whatever it said as the summary, no inline comments (summary-only fallback).
         gh.upsert_comment(
-            repo, pr_number, "bot:review", "### 🐱 Sidekick's code review\n" + note + raw
+            repo, pr_number, "bot:review", f"### {ICON} Sidekick's code review\n" + note + raw
         )
-        return
+        return "failed" if failed(raw) else "done"
 
     verdict = str(data.get("verdict", "comment")).strip().lower()
     issues = [it for it in (data.get("issues") or []) if isinstance(it, dict)]
@@ -276,12 +529,12 @@ def run(repo, pr_number, diff):
     anchorable, unanchorable = partition(issues, anchor_map)
 
     reconcile_inline(
-        repo, pr_number, head_sha, anchorable,
+        repo, pr_number, head_sha, anchorable, token,
         scope=set(anchor_map) if incremental else None,
     )
 
     summary = (
-        "### 🐱 Sidekick's code review\n"
+        f"### {ICON} Sidekick's code review\n"
         + note
         + f"VERDICT: {verdict}\n\n"
         + str(data.get("summary", "")).strip()
@@ -297,13 +550,15 @@ def run(repo, pr_number, diff):
             "APPROVE",
         )
 
+    return "done"
+
 
 def main():
     pr_number = int(os.environ["PR_NUMBER"])
     diff = Path(os.environ["PR_DIFF_FILE"]).read_text(
         encoding="utf-8", errors="replace"
     )
-    run(gh.get_repo(), pr_number, diff)
+    run(gh.get_repo(), pr_number, diff, os.environ["GH_TOKEN"])
 
 
 if __name__ == "__main__":

@@ -28,41 +28,111 @@ def test_labels_for():
     assert labels_for(["LICENSE"], rules) == []
 
 
+def test_kind_from_title():
+    from scripts.label_pr import kind_from_title
+
+    # real titles from this repo's history
+    assert kind_from_title("feat: wire 3 more NVIDIA rungs") == "enhancement"
+    assert kind_from_title("fix: survive Groq's July 17 decommission") == "bug"
+    assert kind_from_title("chore: refresh Sidekick activity") == "chore"
+    assert kind_from_title("docs: mention /context in the welcome template") == "documentation"
+    # conventional-commit shapes: scope, breaking bang, odd casing
+    assert kind_from_title("feat(review): add symbol outline") == "enhancement"
+    assert kind_from_title("refactor(api)!: drop the v1 client") == "refactor"
+    assert kind_from_title("FIX: casing shouldn't matter") == "bug"
+    assert kind_from_title("perf: cache the tree") == "refactor"
+    # no type -> None, so the diff-shape fallback gets a turn
+    assert kind_from_title("Update the scraper filter") is None
+    assert kind_from_title("") is None
+    # a colon alone is not a conventional-commit type
+    assert kind_from_title("WIP: something") is None  # 'wip' isn't in KIND_LABELS
+
+
+def test_kind_from_diff_only_speaks_when_the_shape_is_clear():
+    from scripts.label_pr import kind_from_diff
+
+    # (path, status, additions, deletions)
+    new_feature = [("a.py", "added", 120, 0), ("b.py", "modified", 10, 2)]
+    assert kind_from_diff(new_feature) == "enhancement"  # new file, little removed
+
+    deletion = [("old.py", "removed", 0, 300)]
+    assert kind_from_diff(deletion) == "refactor"  # a whole file taken out
+    assert kind_from_diff([("a.py", "modified", 5, 200)]) == "refactor"  # overwhelmingly removal
+
+    # The honest case: edits to existing files can be a fix OR a feature, so say nothing
+    # rather than guess. This repo's own "fix: survive Groq's decommission" was +180/-24 —
+    # a net-additive bugfix that a shape-only rule would have called an enhancement.
+    assert kind_from_diff([("scripts/config.py", "modified", 180, 24)]) is None
+
+    # lock-file churn is excluded before any of this — it says nothing about intent
+    assert kind_from_diff([("uv.lock", "modified", 5000, 4000)]) is None
+    assert kind_from_diff([]) is None
+
+
+def test_kind_from_branch():
+    from scripts.label_pr import kind_from_branch
+
+    assert kind_from_branch("fix/leaky-us-filter") == "bug"
+    assert kind_from_branch("feat-dark-mode") == "enhancement"
+    assert kind_from_branch("jackie/chore/bump-deps") == "chore"
+    # no conventional-commit word anywhere -> silent, so the next signal gets a turn
+    assert kind_from_branch("patch-1") is None
+    assert kind_from_branch("update-the-scraper-filter") is None
+    assert kind_from_branch("") is None
+
+
+def test_desired_labels_prefers_the_title_over_the_diff():
+    from scripts.label_pr import desired_labels, managed_labels
+
+    files = [("scripts/config.py", "modified", 180, 24)]
+    paths = ["scripts/config.py"]
+    # net-additive edit: the diff shape says nothing, but the title says "bug"
+    assert desired_labels(paths, "fix: survive the decommission", files) == ["bug", "python"]
+    # a new file would read as "enhancement" from shape alone — the title still wins
+    new = [("scripts/new.py", "added", 90, 0)]
+    assert desired_labels(["scripts/new.py"], "fix: restore the missing guard", new) == ["bug", "python"]
+    # no type in the title -> fall back to the shape
+    assert desired_labels(["scripts/new.py"], "Add a guard", new) == ["enhancement", "python"]
+    # every kind label must be in the managed universe, or a stale one could never be
+    # removed when the title is edited
+    for kind in ("enhancement", "bug", "refactor", "chore", "tests", "needs-triage"):
+        assert kind in managed_labels()
+
+
+def test_desired_labels_falls_back_to_branch_then_triage():
+    from scripts.label_pr import desired_labels
+
+    # the guest case: title says nothing, shape says nothing (edit to an existing file)
+    edit = [("scripts/config.py", "modified", 12, 3)]
+    paths = ["scripts/config.py"]
+    assert desired_labels(paths, "Update the scraper filter", edit, "patch-1") == [
+        "needs-triage",
+        "python",
+    ]
+    # ...but a branch that names its intent is taken at its word, ahead of the diff
+    assert desired_labels(paths, "Update the scraper filter", edit, "fix/us-only") == [
+        "bug",
+        "python",
+    ]
+    # the title still outranks the branch when the two disagree
+    assert desired_labels(paths, "chore: bump deps", edit, "fix/us-only") == ["chore", "python"]
+    # and the diff still gets its turn when neither title nor branch speaks
+    new = [("scripts/new.py", "added", 90, 0)]
+    assert desired_labels(["scripts/new.py"], "Add a guard", new, "patch-1") == [
+        "enhancement",
+        "python",
+    ]
+
+
 def test_summarize_empty():
     # empty/whitespace diff short-circuits (no network call to the model)
     assert "No diff" in summarize("   \n  ")
 
 
-def test_summarize_gating():
-    # run() must meter LLM calls — within budget posts a summary, over the
-    # per-PR cap posts the ratelimit note and never touches the model.
-    import scripts.summarize_pr as sp
-    from scripts import limits
-    from scripts.config import PR_DAILY_MAX
-
-    limits._reset()
-    posted, modeled = [], []
-    orig_up, orig_sum = sp.gh.upsert_comment, sp.summarize
-    sp.gh.upsert_comment = lambda repo, n, marker, body: posted.append(marker)
-    sp.summarize = lambda diff: (modeled.append(1), "MODEL")[1]
-
-    class FakeRepo:
-        full_name = "o/r"
-
-    try:
-        for _ in range(PR_DAILY_MAX):  # spend the per-PR budget
-            sp.run(FakeRepo(), 1, "a diff")
-        assert posted == ["bot:summary"] * PR_DAILY_MAX
-        assert len(modeled) == PR_DAILY_MAX
-        sp.run(FakeRepo(), 1, "a diff")  # one over → capped
-        assert posted[-1] == "bot:ratelimit"
-        assert len(modeled) == PR_DAILY_MAX  # model NOT called when capped
-    finally:
-        sp.gh.upsert_comment, sp.summarize = orig_up, orig_sum
 
 
 def test_review_gating():
-    # run() must (a) skip a head SHA already reviewed (free re-/review) and
+    # C6: run() must (a) skip a head SHA already reviewed (free re-/review) and
     # (b) post the ratelimit note instead of calling the model once the per-PR cap
     # is spent.
     import scripts.review_pr as rp
@@ -82,7 +152,7 @@ def test_review_gating():
             rp.repo_context.ensure_fresh)
     rp.complete = lambda s, u, t, **kw: (modeled.append(1), '{"verdict":"approve","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, marker, body: posted.append(marker)
-    rp.gh.get_file_text = lambda repo, path: ""
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
     rp.reconcile_inline = lambda *a, **k: None
     rp.repo_context.ensure_fresh = lambda repo: ""
     try:
@@ -132,7 +202,7 @@ def test_review_routes_by_size():
             rp.repo_context.ensure_fresh)
     rp.complete = fake_complete
     rp.gh.upsert_comment = lambda repo, n, marker, body: bodies.append(body)
-    rp.gh.get_file_text = lambda repo, path: ""
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
     rp.reconcile_inline = lambda *a, **k: None
     rp.repo_context.ensure_fresh = lambda repo: ""
     try:
@@ -184,6 +254,7 @@ def test_build_context_prompt():
 def test_is_stale():
     from datetime import datetime, timedelta, timezone
 
+    from scripts.config import CONTEXT_REFRESH_PRS
     from scripts.repo_context import is_stale
 
     class FakeIssue:
@@ -193,6 +264,43 @@ def test_is_stale():
     assert is_stale(None) is True
     assert is_stale(FakeIssue(1)) is False
     assert is_stale(FakeIssue(31)) is True
+    # young issue goes stale once enough PRs have merged behind it
+    assert is_stale(FakeIssue(1), CONTEXT_REFRESH_PRS - 1) is False
+    assert is_stale(FakeIssue(1), CONTEXT_REFRESH_PRS) is True
+
+
+def test_merged_since():
+    from datetime import datetime, timedelta, timezone
+
+    from scripts.gh import merged_since
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=2)
+
+    class FakePR:
+        def __init__(self, updated_days, merged_days):
+            self.updated_at = now - timedelta(days=updated_days)
+            self.merged_at = None if merged_days is None else now - timedelta(days=merged_days)
+
+    class FakeRepo:
+        def __init__(self, prs):
+            self.prs = prs
+
+        def get_pulls(self, state, sort, direction):
+            return self.prs
+
+    # newest-updated first: 2 merged inside the window, then a closed-unmerged one,
+    # then an older PR that stops the scan (a later merge can't hide behind it).
+    prs = [FakePR(0, 0), FakePR(1, 1), FakePR(1, None), FakePR(9, 9)]
+    assert merged_since(FakeRepo(prs), since, 3) == 2
+    assert merged_since(FakeRepo(prs), since, 1) == 1  # stops at the cap
+    assert merged_since(FakeRepo([FakePR(9, 9)]), since, 3) == 0
+
+    class BoomRepo:
+        def get_pulls(self, state, sort, direction):
+            raise RuntimeError("API down")
+
+    assert merged_since(BoomRepo(), since, 3) == 0  # degrades to age-only staleness
 
 
 def test_repo_context_run_and_ensure_fresh():
@@ -207,7 +315,7 @@ def test_repo_context_run_and_ensure_fresh():
     orig = (rc.gh.get_tree, rc.gh.get_file_text, rc.gh.upsert_issue,
             rc.gh.get_context_issue, rc.complete)
     rc.gh.get_tree = lambda repo: [("a.py", 10)]
-    rc.gh.get_file_text = lambda repo, name: "readme" if name == "README.md" else None
+    rc.gh.get_file_text = lambda repo, name, ref=None: "readme" if name == "README.md" else None
     rc.gh.upsert_issue = lambda repo, marker, title, body: upserted.append(body)
     rc.gh.get_context_issue = lambda repo, marker: None
     rc.complete = lambda system, user, task: "GENERATED CONTEXT"
@@ -339,6 +447,30 @@ def test_complete_json_mode():
         limits._reset()
 
 
+def test_rotate_head():
+    from scripts.llm_client import _rotate_head
+
+    chain = [("nvidia", "a"), ("nvidia", "b"), ("nvidia", "c"),
+             ("groq", "g"), ("github", "h")]
+    # No key -> untouched.
+    assert _rotate_head(chain, None) == chain
+    # The head (GLM, here "a") is pinned first for every key; only the siblings behind it
+    # round-robin. The ordered cross-provider tail stays put.
+    assert _rotate_head(chain, 1) == [("nvidia", "a"), ("nvidia", "c"), ("nvidia", "b"),
+                                      ("groq", "g"), ("github", "h")]
+    for k in range(7):
+        out = _rotate_head(chain, k)
+        assert out[0] == chain[0]           # head never rotates out of first place
+        assert out[3:] == chain[3:]         # tail preserved
+        tail, o = chain[1:3], k % 2
+        assert out[1:3] == tail[o:] + tail[:o]
+    # GLM + a single sibling — nothing to spread behind the pinned head, returned as-is.
+    assert _rotate_head([("nvidia", "x"), ("nvidia", "y"), ("groq", "z")], 5) == \
+        [("nvidia", "x"), ("nvidia", "y"), ("groq", "z")]
+    # Single-model head (summary/context/reply) — nothing to spread, returned as-is.
+    assert _rotate_head([("nvidia", "x"), ("groq", "y")], 5) == [("nvidia", "x"), ("groq", "y")]
+
+
 def test_build_prompt_includes_pr_text():
     from scripts.review_pr import build_prompt
 
@@ -355,6 +487,44 @@ def test_build_prompt_includes_project_context():
     assert "This repo does X." in p
     assert p.index("This repo does X.") < p.index("DIFF")  # context before the diff
     assert "Project context" not in build_prompt("DIFF", conventions="")  # optional, omitted when absent
+
+
+def test_file_symbols_finds_helpers_defined_outside_the_diff():
+    from scripts.review_pr import file_symbols
+
+    # The real miss: a reviewer flagged `clean_space` as "not imported or defined" because
+    # it sat ~120 lines above the changed hunk and so never appeared in the diff.
+    source = "import re\n\n\ndef clean_space(value):\n    return value.strip()\n\n\nclass Thing:\n    def method(self):\n        pass\n"
+    syms = file_symbols(source)
+    assert "clean_space (line 4)" in syms  # the helper the reviewer couldn't see
+    assert "Thing (line 8)" in syms
+    assert not any(s.startswith("method ") for s in syms)  # nested def isn't the file's surface
+
+    # other languages these repos actually use
+    assert "handler (line 1)" in file_symbols("export function handler() {}\n")
+    assert "Config (line 1)" in file_symbols("type Config struct {\n}\n")
+    assert "parse (line 1)" in file_symbols("pub fn parse(s: &str) {}\n")
+    assert file_symbols("") == []
+
+
+def test_symbol_outline_lands_in_the_prompt_before_the_diff():
+    from scripts.review_pr import build_prompt, build_symbol_outline, changed_paths
+
+    diff = (
+        "diff --git a/job_board/classifier.py b/job_board/classifier.py\n"
+        "--- a/job_board/classifier.py\n+++ b/job_board/classifier.py\n"
+        "@@ -1,2 +1,3 @@\n+x = 1\n"
+    )
+    assert changed_paths(diff) == ["job_board/classifier.py"]
+
+    outline = build_symbol_outline({"job_board/classifier.py": "def clean_space(v):\n    pass\n"})
+    assert outline == "job_board/classifier.py: clean_space (line 1)"
+
+    p = build_prompt("DIFF", conventions="rules", symbol_outline=outline)
+    assert "clean_space (line 1)" in p
+    assert p.index("clean_space") < p.index("DIFF")  # the reviewer sees it before judging
+    assert "do not report" in p  # the instruction is what actually stops the false positive
+    assert "Top-level symbols" not in build_prompt("DIFF", conventions="rules")  # optional
 
 
 def test_run_feeds_pr_text_to_model():
@@ -379,7 +549,7 @@ def test_run_feeds_pr_text_to_model():
     # `u` is a per-model prompt builder now — resolve it the way complete() would.
     rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, marker, body: None
-    rp.gh.get_file_text = lambda repo, path: ""
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
     rp.reconcile_inline = lambda *a, **k: None
     rp.repo_context.ensure_fresh = lambda repo: ""
     try:
@@ -410,13 +580,52 @@ def test_run_feeds_project_context_to_model():
     # `u` is a per-model prompt builder now — resolve it the way complete() would.
     rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, marker, body: None
-    rp.gh.get_file_text = lambda repo, path: ""
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
     rp.reconcile_inline = lambda *a, **k: None
     rp.repo_context.ensure_fresh = lambda repo: "PROJECT DOES Y"
     try:
         limits._reset()
         rp.run(FakeRepo(), 9, "a diff")
         assert "PROJECT DOES Y" in prompts[0]
+    finally:
+        (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+         rp.repo_context.ensure_fresh) = orig
+        limits._reset()
+
+
+def test_run_feeds_file_contents_to_large_budget_models_only():
+    import scripts.review_pr as rp
+    from scripts import limits
+    from scripts.config import NVIDIA_GLM
+
+    prompts_by_model = {}
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h"}), "title": "t", "body": ""})()
+
+    # `u` is the per-model prompt builder; call it for a large-budget model and a small one.
+    def fake_complete(s, u, t, **kw):
+        prompts_by_model["large"] = u(NVIDIA_GLM)
+        prompts_by_model["small"] = u("groq/whatever-small")
+        return '{"verdict":"comment","summary":"ok","issues":[]}'
+
+    diff = _block("mod.py", "+x = 1\n")
+    orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+            rp.repo_context.ensure_fresh)
+    rp.complete = fake_complete
+    rp.gh.upsert_comment = lambda repo, n, marker, body: None
+    # get_file_text feeds both CLAUDE.md and the changed-file bodies; return a distinctive body.
+    rp.gh.get_file_text = lambda repo, path, ref=None: "SENTINEL_BODY = 42\n" if path == "mod.py" else ""
+    rp.reconcile_inline = lambda *a, **k: None
+    rp.repo_context.ensure_fresh = lambda repo: ""
+    try:
+        limits._reset()
+        rp.run(FakeRepo(), 1, diff)
+        assert "SENTINEL_BODY = 42" in prompts_by_model["large"]  # NVIDIA sees the file body
+        assert "SENTINEL_BODY = 42" not in prompts_by_model["small"]  # small rung does not
     finally:
         (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
          rp.repo_context.ensure_fresh) = orig
@@ -557,33 +766,139 @@ def test_unified_from_files():
     assert "gone.py" not in a and "bin.png" not in out
 
 
-def test_reconcile_scope():
-    # scope limits stale-deletion to the re-reviewed files; None means everything.
+class _RC:
+    """A fake review comment root. No delete() on purpose — a delete() call would
+    AttributeError and fail the test, which is how we assert reconcile never deletes."""
+
+    def __init__(self, cid, path, line, body="x\n<!-- bot:review-inline -->"):
+        self.id, self.path, self.line, self.body = cid, path, line, body
+        self.in_reply_to_id = None
+
+    def edit(self, body):
+        self.body = body
+
+
+def _reconcile_fakes(rp, comments, thread_state):
+    """Wire the gh calls reconcile_inline makes; return (edited, resolved, unresolved)
+    capture lists and the originals to restore."""
+    edited, resolved, unresolved = [], [], []
+    _orig_edit = _RC.edit
+    _RC.edit = lambda self, body: (_orig_edit(self, body), edited.append((self.id, body)))[0]
+    orig = (rp.gh.get_review_comments, rp.gh.create_review_comment,
+            rp.gh.review_thread_state, rp.gh.resolve_thread, rp.gh.unresolve_thread)
+    rp.gh.get_review_comments = lambda repo, n: comments
+    rp.gh.create_review_comment = lambda *a, **k: None
+    rp.gh.review_thread_state = lambda repo, n, token: thread_state
+    rp.gh.resolve_thread = lambda token, tid: resolved.append(tid)
+    rp.gh.unresolve_thread = lambda token, tid: unresolved.append(tid)
+
+    def restore():
+        _RC.edit = _orig_edit
+        (rp.gh.get_review_comments, rp.gh.create_review_comment,
+         rp.gh.review_thread_state, rp.gh.resolve_thread, rp.gh.unresolve_thread) = orig
+
+    return edited, resolved, unresolved, restore
+
+
+def test_reconcile_resolves_stale_instead_of_deleting():
+    # A stale root (issue no longer flagged, in scope) is RESOLVED + noted, never
+    # deleted; a stale root OUTSIDE scope is left untouched.
     import scripts.review_pr as rp
 
-    deleted = []
-
-    class C:
-        def __init__(self, path, line):
-            self.path, self.line, self.body = path, line, "b"
-
-        def delete(self):
-            deleted.append((self.path, self.line))
-
-        def edit(self, body):
-            pass
-
-    orig = (rp.gh.get_inline_comments, rp.gh.create_review_comment)
-    rp.gh.get_inline_comments = lambda *a: [C("a.py", 1), C("b.py", 2)]
-    rp.gh.create_review_comment = lambda *a: None
+    a, b = _RC(1, "a.py", 1), _RC(2, "b.py", 2)
+    edited, resolved, unresolved, restore = _reconcile_fakes(
+        rp, [a, b], {1: ("T1", False), 2: ("T2", False)})
     try:
-        rp.reconcile_inline(None, 1, "sha", [], scope={"a.py"})
-        assert deleted == [("a.py", 1)]  # b.py untouched by this review -> kept
-        deleted.clear()
-        rp.reconcile_inline(None, 1, "sha", [])
-        assert sorted(deleted) == [("a.py", 1), ("b.py", 2)]  # full review -> all stale
+        # incremental review looked only at a.py: a.py:1 is stale-in-scope -> resolve;
+        # b.py:2 is out of scope -> untouched.
+        rp.reconcile_inline(None, 1, "sha", [], "tok", scope={"a.py"})
+        assert resolved == ["T1"] and unresolved == []
+        assert any(cid == 1 and "no longer flags this" in body for cid, body in edited)
+        assert all(cid != 2 for cid, _ in edited)  # b.py never touched
+
+        # full review (scope=None): both stale -> both resolved.
+        edited.clear(); resolved.clear()
+        a.body = b.body = "x\n<!-- bot:review-inline -->"
+        rp.reconcile_inline(None, 1, "sha", [], "tok")
+        assert sorted(resolved) == ["T1", "T2"]
     finally:
-        rp.gh.get_inline_comments, rp.gh.create_review_comment = orig
+        restore()
+
+
+def test_reconcile_unresolves_on_recurrence_and_degrades_safe():
+    import scripts.review_pr as rp
+
+    # (1) recurrence: a resolved thread whose issue is back in `desired` -> unresolve +
+    #     rewrite the body clean (the "no longer flags" note is dropped).
+    root = _RC(1, "a.py", 1, "old\n<!-- bot:review-inline -->")
+    edited, resolved, unresolved, restore = _reconcile_fakes(
+        rp, [root], {1: ("T1", True)})  # currently resolved
+    try:
+        want = {"path": "a.py", "line": 1, "severity": "major", "body": "still broken"}
+        rp.reconcile_inline(None, 1, "sha", [want], "tok")
+        assert unresolved == ["T1"] and resolved == []
+        assert "still broken" in root.body and "no longer flags this" not in root.body
+    finally:
+        restore()
+
+    # (2) idempotent: a stale root already resolved + noted -> no re-resolve, no edit.
+    noted = _RC(2, "b.py", 2,
+                f"x\n\n{rp._RESOLVED_NOTE}\n<!-- bot:review-inline -->")
+    edited, resolved, unresolved, restore = _reconcile_fakes(rp, [noted], {2: ("T2", True)})
+    try:
+        rp.reconcile_inline(None, 1, "sha", [], "tok")
+        assert resolved == [] and unresolved == [] and edited == []
+    finally:
+        restore()
+
+    # (3) degrade-safe: the thread-state read returned {} (GraphQL failed) -> no
+    #     resolve/unresolve and no delete; the note is still added.
+    stale = _RC(3, "c.py", 3)
+    edited, resolved, unresolved, restore = _reconcile_fakes(rp, [stale], {})
+    try:
+        rp.reconcile_inline(None, 1, "sha", [], "tok")
+        assert resolved == [] and unresolved == []
+        assert "no longer flags this" in stale.body
+    finally:
+        restore()
+
+
+def test_gh_review_thread_state_and_resolve():
+    from scripts import gh
+
+    class R:
+        full_name = "o/r"
+
+    orig = gh.graphql
+    try:
+        # review_thread_state parses {databaseId -> (node_id, is_resolved)} and skips a
+        # thread whose root comment has no databaseId.
+        gh.graphql = lambda token, q, v: {"data": {"repository": {"pullRequest": {
+            "reviewThreads": {"nodes": [
+                {"id": "T1", "isResolved": True, "comments": {"nodes": [{"databaseId": 11}]}},
+                {"id": "T2", "isResolved": False, "comments": {"nodes": [{"databaseId": 22}]}},
+                {"id": "T3", "isResolved": False, "comments": {"nodes": []}},
+            ]}}}}}
+        assert gh.review_thread_state(R(), 5, "tok") == {11: ("T1", True), 22: ("T2", False)}
+
+        # resolve/unresolve send the right mutation with the thread id.
+        captured = []
+        gh.graphql = lambda token, q, v: captured.append((q, v)) or {}
+        gh.resolve_thread("tok", "T9")
+        gh.unresolve_thread("tok", "T9")
+        assert "resolveReviewThread" in captured[0][0] and captured[0][1] == {"id": "T9"}
+        assert "unresolveReviewThread" in captured[1][0] and captured[1][1] == {"id": "T9"}
+
+        # A GraphQL failure degrades: state -> {}, mutations swallow (best-effort).
+        def boom(*a, **k):
+            raise RuntimeError("network")
+
+        gh.graphql = boom
+        assert gh.review_thread_state(R(), 5, "tok") == {}
+        gh.resolve_thread("tok", "T9")    # must not raise
+        gh.unresolve_thread("tok", "T9")  # must not raise
+    finally:
+        gh.graphql = orig
 
 
 def test_review_incremental():
@@ -603,13 +918,15 @@ def test_review_incremental():
 
     full = _block("full.py", "+base\n") + _block("changed.py", "+base\n")
     orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text,
-            rp.reconcile_inline, rp.gh.compare_diff, rp.repo_context.ensure_fresh)
+            rp.reconcile_inline, rp.gh.compare_diff, rp.gh.get_inline_comments,
+            rp.repo_context.ensure_fresh)
     # `u` is a per-model prompt builder now — resolve it the way complete() would.
     rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
     rp.gh.upsert_comment = lambda repo, n, m, body: bodies.append(body)
-    rp.gh.get_file_text = lambda repo, path: ""
-    rp.reconcile_inline = lambda repo, n, s, anch, scope=None: scopes.append(scope)
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
+    rp.reconcile_inline = lambda repo, n, s, anch, token, scope=None: scopes.append(scope)
     rp.gh.compare_diff = lambda repo, base, head: _block("changed.py", "+delta\n")
+    rp.gh.get_inline_comments = lambda repo, n, marker: []
     rp.repo_context.ensure_fresh = lambda repo: ""
     try:
         limits._reset()
@@ -632,7 +949,8 @@ def test_review_incremental():
         assert "full.py" in prompts[2] and scopes[2] is None  # fallback: full review
     finally:
         (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text,
-         rp.reconcile_inline, rp.gh.compare_diff, rp.repo_context.ensure_fresh) = orig
+         rp.reconcile_inline, rp.gh.compare_diff, rp.gh.get_inline_comments,
+         rp.repo_context.ensure_fresh) = orig
         limits._reset()
 
 
@@ -729,7 +1047,7 @@ def test_blockers():
 
 
 def test_merge_gating():
-    # run() must refuse to merge while any gate fails (dirty state, unresolved
+    # C7: run() must refuse to merge while any gate fails (dirty state, unresolved
     # threads) and squash-merge only when all gates are clean.
     import scripts.merge_pr as mp
 
@@ -777,31 +1095,523 @@ def test_merge_gating():
         mp.gh.graphql, mp.gh.upsert_comment = orig
 
 
+def test_build_file_contents_numbers_and_bounds():
+    from scripts.review_pr import build_file_contents
+
+    files = {"a.py": "import os\n\n\ndef f():\n    return 1\n", "b.py": "x = 2\n"}
+    out = build_file_contents(files, max_chars=10000)
+    assert "a.py:" in out and "b.py:" in out
+    assert "1| import os" in out            # line-numbered from 1
+    assert "4| def f():" in out             # numbers track real file lines
+    assert out.index("a.py:") < out.index("b.py:")  # diff order preserved
+
+    # a single oversized file is skipped (likely generated), the rest still render
+    big = {"huge.py": "z\n" * 5000, "small.py": "ok\n"}
+    out2 = build_file_contents(big, max_chars=100000, per_file_max=100)
+    assert "huge.py" not in out2 and "1| ok" in out2
+
+    # budget stops the list at whole-file granularity — never a half file. Size the
+    # budget to exactly one whole a.py block (measured via a single-file render) so
+    # a.py fits and b.py doesn't.
+    a_block = build_file_contents({"a.py": files["a.py"]}, max_chars=100000)
+    out3 = build_file_contents(files, max_chars=len(a_block))
+    assert "a.py:" in out3 and "b.py:" not in out3
+
+    # a budget too small for even the first file yields nothing — never an over-budget file
+    assert build_file_contents(files, max_chars=1) == ""
+    assert build_file_contents(files, max_chars=0) == ""
+    assert build_file_contents({}, max_chars=1000) == ""
+
+
+def test_build_prompt_includes_file_contents():
+    from scripts.review_pr import build_prompt
+
+    p = build_prompt("DIFF", conventions="rules", file_contents="a.py:\n1| x = 1")
+    assert "1| x = 1" in p
+    assert p.index("1| x = 1") < p.index("DIFF")  # full files before the diff
+    assert "only raise issues on lines the diff" in p  # the scoping instruction
+    assert "1| x = 1" not in build_prompt("DIFF", conventions="rules")  # optional
+
+
+def test_prior_issues_text_roots_in_scope_only():
+    from scripts.review_pr import prior_issues_text
+
+    class C:
+        def __init__(self, path, line, body, reply_to=None):
+            self.path, self.line, self.body = path, line, body
+            self.in_reply_to_id = reply_to
+
+    comments = [
+        C("a.py", 10, "**[major]** off-by-one here\n<!-- bot:review-inline -->"),
+        C("a.py", 20, "a human reply", reply_to=999),   # reply, not a root -> excluded
+        C("b.py", 5, "**[nit]** rename this\n<!-- bot:review-inline -->"),  # out of scope
+    ]
+    out = prior_issues_text(comments, scope={"a.py"})
+    assert "a.py:10" in out and "off-by-one here" in out
+    assert "<!-- bot:review-inline -->" not in out  # marker stripped
+    assert "**[major]**" not in out                  # severity prefix stripped
+    assert "b.py" not in out                          # scope excludes it
+    assert "a.py:20" not in out                       # reply excluded
+    assert prior_issues_text([], scope={"a.py"}) == ""
+
+
+def test_prior_issues_text_skips_resolved_roots():
+    from scripts.review_pr import _RESOLVED_NOTE, prior_issues_text
+
+    class C:
+        def __init__(self, path, line, body, reply_to=None):
+            self.path, self.line, self.body = path, line, body
+            self.in_reply_to_id = reply_to
+
+    comments = [
+        C("a.py", 10, "**[major]** still broken\n<!-- bot:review-inline -->"),
+        C("a.py", 20, f"**[nit]** old thing\n\n{_RESOLVED_NOTE}\n<!-- bot:review-inline -->"),
+    ]
+    out = prior_issues_text(comments, scope={"a.py"})
+    assert "a.py:10" in out and "still broken" in out   # genuinely open -> included
+    assert "a.py:20" not in out                          # already resolved-away -> skipped
+
+
+def test_build_prompt_includes_prior_issues():
+    from scripts.review_pr import build_prompt
+
+    p = build_prompt("DIFF", conventions="rules", prior_issues="- a.py:10 — off-by-one")
+    assert "a.py:10 — off-by-one" in p
+    assert p.index("a.py:10") < p.index("DIFF")       # history before the new diff
+    assert "do NOT report it again" in p              # the fix-confirmation instruction
+    assert "a.py:10" not in build_prompt("DIFF", conventions="rules")  # optional
+
+
+def test_run_feeds_prior_issues_on_incremental():
+    import scripts.review_pr as rp
+    from scripts import limits
+
+    prompts, sha = [], {"v": "h1"}
+
+    class C:
+        def __init__(self, path, line, body, reply_to=None):
+            self.path, self.line, self.body = path, line, body
+            self.in_reply_to_id = reply_to
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": sha["v"]}), "title": "t", "body": ""})()
+
+    full = _block("changed.py", "+base\n")
+    orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+            rp.gh.compare_diff, rp.gh.get_inline_comments, rp.repo_context.ensure_fresh)
+    rp.complete = lambda s, u, t, **kw: (prompts.append(u("m") if callable(u) else u), '{"verdict":"comment","summary":"ok","issues":[]}')[1]
+    rp.gh.upsert_comment = lambda repo, n, m, body: None
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
+    rp.reconcile_inline = lambda *a, **k: None
+    rp.gh.compare_diff = lambda repo, base, head: _block("changed.py", "+delta\n")
+    rp.gh.get_inline_comments = lambda repo, n, marker: [
+        C("changed.py", 1, "**[major]** still broken\n<!-- bot:review-inline -->"),
+    ]
+    rp.repo_context.ensure_fresh = lambda repo: ""
+    try:
+        limits._reset()
+        rp.run(FakeRepo(), 1, full)                 # first review: full, no prior section
+        assert "still broken" not in prompts[0]
+        sha["v"] = "h2"
+        rp.run(FakeRepo(), 1, full)                 # incremental: prior issues folded in
+        assert "still broken" in prompts[1] and "changed.py:1" in prompts[1]
+    finally:
+        (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+         rp.gh.compare_diff, rp.gh.get_inline_comments, rp.repo_context.ensure_fresh) = orig
+        limits._reset()
+
+
+def test_reply_thread_prompt_pieces():
+    from scripts.reply_thread import build_reply_prompt, render_thread
+
+    class C:
+        def __init__(self, login, body):
+            self.user = type("U", (), {"login": login})()
+            self.body = body
+
+    thread = [C("sidekick-cat[bot]", "This looks off."), C("dev", "Why? It's intentional.")]
+    t = render_thread(thread)
+    assert "sidekick-cat[bot]" in t and "This looks off." in t
+    assert "dev" in t and "Why? It's intentional." in t
+    assert t.index("This looks off.") < t.index("Why?")  # chronological
+
+    p = build_reply_prompt("rules", "1| x = 1\n", "a.py", "@@ -1 +1 @@\n+x = 1", t)
+    assert "rules" in p and "a.py" in p and "1| x = 1" in p
+    assert "@@ -1 +1 @@" in p and "Why? It's intentional." in p
+
+
+def test_reply_thread_run_only_answers_bot_threads():
+    import scripts.reply_thread as rt
+    from scripts import limits
+
+    posted = []
+
+    class C:
+        def __init__(self, body, path="a.py", id=99):
+            self.body, self.path, self.diff_hunk, self.id = body, path, "@@", id
+            self.user = type("U", (), {"login": "dev"})()
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h"})})()
+
+    orig = (rt.gh.get_review_comment_thread, rt.gh.get_file_text,
+            rt.gh.create_review_comment_reply, rt.complete)
+    rt.gh.get_file_text = lambda repo, path, ref=None: "rules"
+    rt.gh.create_review_comment_reply = lambda repo, n, rid, body: posted.append((rid, body))
+    rt.complete = lambda s, u, t: "Here's why."
+    try:
+        limits._reset()
+        # a non-bot thread root (no marker) -> no reply, no model call
+        rt.gh.get_review_comment_thread = lambda repo, n, rid: (C("just a human note"), [C("just a human note")])
+        rt.run(FakeRepo(), 1, 5)
+        assert posted == []
+
+        # a bot thread -> reply posted to the RESOLVED root id, carrying marker + persona.
+        # rid=5 is passed to run() but the resolved root has id 99: the reply must target 99.
+        root = C("**[major]** bug\n<!-- bot:review-inline -->", id=99)
+        rt.gh.get_review_comment_thread = lambda repo, n, rid: (root, [root, C("why?", id=100)])
+        rt.run(FakeRepo(), 1, 5)
+        assert len(posted) == 1 and posted[0][0] == 99  # posted to the root, not the webhook id
+        assert rt.ICON in posted[0][1] and "bot:review-reply" in posted[0][1]
+
+        # a failed completion (⚠️) -> silence
+        posted.clear()
+        rt.complete = lambda s, u, t: "⚠️ AI quota reached, try again later."
+        rt.run(FakeRepo(), 1, 5)
+        assert posted == []
+    finally:
+        (rt.gh.get_review_comment_thread, rt.gh.get_file_text,
+         rt.gh.create_review_comment_reply, rt.complete) = orig
+        limits._reset()
+
+
+def test_review_run_returns_done_or_failed():
+    import scripts.review_pr as rp
+    from scripts import limits
+    from scripts import llm_client
+    from scripts.config import PR_DAILY_MAX
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h0"}), "title": "t", "body": ""})()
+
+    orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+            rp.repo_context.ensure_fresh)
+    rp.gh.upsert_comment = lambda repo, n, marker, body: None
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
+    rp.reconcile_inline = lambda *a, **k: None
+    rp.repo_context.ensure_fresh = lambda repo: ""
+    try:
+        # A model that answers with parseable JSON -> "done".
+        rp.complete = lambda s, u, t, **kw: '{"verdict":"approve","summary":"ok","issues":[]}'
+        limits._reset()
+        assert rp.run(FakeRepo(), 1, _block("app.py")) == "done"
+
+        # A noise-only diff reviews nothing -> still "done" (clean, not failed).
+        limits._reset()
+        assert rp.run(FakeRepo(), 1, _block("uv.lock")) == "done"
+
+        # A model that returns a sentinel (quota/outage) -> "failed".
+        rp.complete = lambda s, u, t, **kw: llm_client._QUOTA_MSG
+        limits._reset()
+        assert rp.run(FakeRepo(), 1, _block("app.py")) == "failed"
+
+        # Over the daily cap -> "failed" (no review ran).
+        limits._reset()
+        for _ in range(PR_DAILY_MAX):
+            assert limits.allow_llm_call("o/r", 1)[0]
+        assert rp.run(FakeRepo(), 1, _block("app.py")) == "failed"
+    finally:
+        (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+         rp.repo_context.ensure_fresh) = orig
+        limits._reset()
+
+
+def test_review_skips_when_the_noise_strip_leaves_nothing():
+    # A lockfile-only push: strip_noise eats the whole diff. Reviewing what's left would
+    # ask a model to review nothing AND spend a budget unit doing it. Silence, not a
+    # comment: "nothing to review" on every dependency bump is noise. The head is still
+    # recorded so the next push compares from here.
+    import scripts.review_pr as rp
+    from scripts import limits
+    from scripts.config import PR_DAILY_MAX
+
+    modeled, posted = [], []
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h0"}), "title": "t", "body": ""})()
+
+    orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+            rp.repo_context.ensure_fresh)
+    rp.complete = lambda s, u, t, **kw: (modeled.append(1), '{"verdict":"approve","summary":"ok","issues":[]}')[1]
+    rp.gh.upsert_comment = lambda repo, n, marker, body: posted.append(marker)
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
+    rp.reconcile_inline = lambda *a, **k: None
+    rp.repo_context.ensure_fresh = lambda repo: ""
+    try:
+        limits._reset()
+        rp.run(FakeRepo(), 1, _block("uv.lock") + _block("package-lock.json"))
+        assert modeled == []                            # no model call
+        assert posted == []                             # and no comment
+        assert limits.reviewed_head("o/r", 1) == "h0"   # head recorded: next push compares from here
+        # The budget is untouched — the whole point of stripping before the cap check.
+        for _ in range(PR_DAILY_MAX):
+            assert limits.allow_llm_call("o/r", 1)[0]
+
+        # Sanity: a diff with real code in it still reviews normally.
+        limits._reset()
+        rp.run(FakeRepo(), 1, _block("app.py") + _block("uv.lock"))
+        assert modeled == [1] and posted == ["bot:review"]
+    finally:
+        (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+         rp.repo_context.ensure_fresh) = orig
+        limits._reset()
+
+
+def test_review_does_not_burn_the_head_when_no_model_answers():
+    # complete() returns a sentinel instead of raising, so a failed review is just a
+    # string. If run() recorded the head anyway, the `prev == head_sha` early-return
+    # would make that commit permanently un-reviewable: /review would silently do
+    # nothing forever and only a new push could clear it. A breaker cooldown would
+    # strand every push it covered.
+    import scripts.review_pr as rp
+    from scripts import limits
+    from scripts.llm_client import _QUOTA_MSG
+
+    posted, modeled = [], []
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h0"}), "title": "t", "body": ""})()
+
+    orig = (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+            rp.repo_context.ensure_fresh)
+    rp.gh.upsert_comment = lambda repo, n, marker, body: posted.append(marker)
+    rp.gh.get_file_text = lambda repo, path, ref=None: ""
+    rp.reconcile_inline = lambda *a, **k: None
+    rp.repo_context.ensure_fresh = lambda repo: ""
+    try:
+        limits._reset()
+        # every rung is down -> complete() hands back the sentinel
+        rp.complete = lambda s, u, t, **kw: (modeled.append(1), _QUOTA_MSG)[1]
+        rp.run(FakeRepo(), 1, "a diff")
+        assert posted == ["bot:review"]  # the ⚠️ still reaches the author
+        assert limits.reviewed_head("o/r", 1) is None  # ...but the head stays retryable
+
+        # provider recovers -> the SAME head still gets its review, no re-push needed
+        rp.complete = lambda s, u, t, **kw: (
+            modeled.append(1), '{"verdict":"approve","summary":"ok","issues":[]}')[1]
+        rp.run(FakeRepo(), 1, "a diff")
+        assert len(modeled) == 2 and limits.reviewed_head("o/r", 1) == "h0"
+
+        rp.run(FakeRepo(), 1, "a diff")  # now recorded -> re-review is free
+        assert len(modeled) == 2
+    finally:
+        (rp.complete, rp.gh.upsert_comment, rp.gh.get_file_text, rp.reconcile_inline,
+         rp.repo_context.ensure_fresh) = orig
+        limits._reset()
+
+
+def test_reply_thread_bills_its_own_bucket():
+    # A conversation in the threads must not spend the reviews of the PR it is about:
+    # reply_thread bills a synthetic "<pr>:reply" key, so an exhausted review budget
+    # still leaves the author an answer. Reverting that key makes this test fail.
+    import scripts.reply_thread as rt
+    from scripts import limits
+    from scripts.config import PR_DAILY_MAX
+
+    posted = []
+
+    class C:
+        def __init__(self, body, path="a.py", id=99):
+            self.body, self.path, self.diff_hunk, self.id = body, path, "@@", id
+            self.user = type("U", (), {"login": "dev"})()
+
+    class FakeRepo:
+        full_name = "o/r"
+
+        def get_pull(self, n):
+            return type("P", (), {"head": type("H", (), {"sha": "h"})})()
+
+    root = C("**[major]** bug\n<!-- bot:review-inline -->", id=99)
+    orig = (rt.gh.get_review_comment_thread, rt.gh.get_file_text,
+            rt.gh.create_review_comment_reply, rt.complete)
+    rt.gh.get_review_comment_thread = lambda repo, n, rid: (root, [root, C("why?", id=100)])
+    rt.gh.get_file_text = lambda repo, path, ref=None: "rules"
+    rt.gh.create_review_comment_reply = lambda repo, n, rid, body: posted.append(rid)
+    rt.complete = lambda s, u, t: "Here's why."
+    try:
+        limits._reset()
+        for _ in range(PR_DAILY_MAX):  # spend PR 1's REVIEW budget dry
+            assert limits.allow_llm_call("o/r", 1)[0]
+        assert not limits.allow_llm_call("o/r", 1)[0]  # reviews are capped...
+        rt.run(FakeRepo(), 1, 5)
+        assert posted == [99]  # ...but the thread still gets its answer
+
+        # the reply bucket is finite too — spend the rest of it, then silence.
+        for _ in range(PR_DAILY_MAX - 1):  # run() already spent 1
+            limits.allow_llm_call("o/r", "1:reply")
+        posted.clear()
+        rt.run(FakeRepo(), 1, 5)
+        assert posted == []
+    finally:
+        (rt.gh.get_review_comment_thread, rt.gh.get_file_text,
+         rt.gh.create_review_comment_reply, rt.complete) = orig
+        limits._reset()
+
+
+def test_classify_thread_reply():
+    from server.router import classify
+
+    def payload(assoc="MEMBER", reply_to=42, sender_type="User", login="dev"):
+        return {
+            "sender": {"type": sender_type, "login": login},
+            "repository": {"full_name": "o/r"},
+            "installation": {"id": 9},
+            "action": "created",
+            "pull_request": {"number": 7},
+            "comment": {"id": 100, "in_reply_to_id": reply_to, "author_association": assoc},
+        }
+
+    got = classify("pull_request_review_comment", payload())
+    assert got["kind"] == "thread_reply"
+    assert got["number"] == 7 and got["comment_id"] == 100 and got["in_reply_to_id"] == 42
+    assert got["owner"] == "o" and got["repo"] == "r" and got["installation_id"] == 9
+
+    # a new thread (not a reply) is ignored — replies only
+    assert classify("pull_request_review_comment", payload(reply_to=None))["kind"] == "ignore"
+    # unauthorized commenter ignored
+    assert classify("pull_request_review_comment", payload(assoc="NONE"))["kind"] == "ignore"
+    # the bot's own reply is ignored by the existing loop guard
+    assert classify("pull_request_review_comment",
+                    payload(sender_type="Bot", login="sidekick-cat[bot]"))["kind"] == "ignore"
+
+
+def test_review_comment_helpers():
+    from scripts import gh
+
+    class C:
+        def __init__(self, cid, path, line, body, reply_to=None):
+            self.id, self.path, self.line, self.body = cid, path, line, body
+            self.in_reply_to_id = reply_to
+
+    root = C(1, "a.py", 10, "**[major]** bug\n<!-- bot:review-inline -->")
+    human = C(2, "a.py", 10, "why?", reply_to=1)
+    other_root = C(3, "b.py", 5, "note\n<!-- bot:review-inline -->")
+    # a reply that ALSO carries the marker (e.g. the bot's own answer) must still be
+    # excluded — proves the in_reply_to_id filter, not just the marker filter
+    marked_reply = C(4, "a.py", 10, "ack\n<!-- bot:review-inline -->", reply_to=1)
+    replied = []
+
+    class Pull:
+        def get_review_comments(self):
+            return [root, human, other_root, marked_reply]
+
+        def create_review_comment_reply(self, comment_id, body):
+            replied.append((comment_id, body))
+
+    class FakeRepo:
+        def get_pull(self, n):
+            return Pull()
+
+    # get_inline_comments returns ROOTS with the marker only — both the unmarked human
+    # reply (id 2) and the MARKED reply (id 4) are excluded; only roots 1 and 3 remain
+    roots = gh.get_inline_comments(FakeRepo(), 1, "bot:review-inline")
+    assert [c.id for c in roots] == [1, 3]
+
+    # get_review_comment_thread returns the root + its replies, in id order
+    r, thread = gh.get_review_comment_thread(FakeRepo(), 1, 1)
+    assert r is root and [c.id for c in thread] == [1, 2, 4]
+
+    # a missing root -> (None, [])
+    assert gh.get_review_comment_thread(FakeRepo(), 1, 999) == (None, [])
+
+    gh.create_review_comment_reply(FakeRepo(), 1, 1, "hi")
+    assert replied == [(1, "hi")]
+
+
+def test_get_review_comment_thread_resolves_root_from_any_comment():
+    # Passing a REPLY's id (or a webhook's in_reply_to_id) must resolve up to the thread
+    # root, so the flow keys off the root's marker and posts to the root — not a reply.
+    from scripts import gh
+
+    class C:
+        def __init__(self, cid, path, line, body, reply_to=None):
+            self.id, self.path, self.line, self.body = cid, path, line, body
+            self.in_reply_to_id = reply_to
+
+    root = C(1, "a.py", 10, "**[major]** bug\n<!-- bot:review-inline -->")
+    reply = C(2, "a.py", 10, "why?", reply_to=1)
+    reply2 = C(3, "a.py", 10, "still?", reply_to=1)
+
+    class Pull:
+        def get_review_comments(self):
+            return [root, reply, reply2]
+
+    class FakeRepo:
+        def get_pull(self, n):
+            return Pull()
+
+    # given a reply id -> resolves to the root, returns the whole thread in id order
+    r, thread = gh.get_review_comment_thread(FakeRepo(), 1, 2)
+    assert r is root and [c.id for c in thread] == [1, 2, 3]
+    # given the root id directly -> unchanged behavior
+    r2, thread2 = gh.get_review_comment_thread(FakeRepo(), 1, 1)
+    assert r2 is root and [c.id for c in thread2] == [1, 2, 3]
+    # an unknown id -> (None, [])
+    assert gh.get_review_comment_thread(FakeRepo(), 1, 999) == (None, [])
+
+
 if __name__ == "__main__":
     test_missing_sections()
     test_labels_for()
+    test_kind_from_title()
+    test_kind_from_diff_only_speaks_when_the_shape_is_clear()
+    test_kind_from_branch()
+    test_desired_labels_prefers_the_title_over_the_diff()
+    test_desired_labels_falls_back_to_branch_then_triage()
     test_summarize_empty()
-    test_summarize_gating()
     test_review_gating()
     test_review_routes_by_size()
     test_render_tree()
     test_pick_head_files()
     test_build_context_prompt()
     test_is_stale()
+    test_merged_since()
     test_repo_context_run_and_ensure_fresh()
     test_anchors()
     test_strip_noise()
     test_truncate_diff_per_file()
     test_complete_json_mode()
+    test_build_file_contents_numbers_and_bounds()
+    test_build_prompt_includes_file_contents()
     test_build_prompt_includes_pr_text()
     test_build_prompt_includes_project_context()
+    test_file_symbols_finds_helpers_defined_outside_the_diff()
+    test_symbol_outline_lands_in_the_prompt_before_the_diff()
     test_run_feeds_pr_text_to_model()
     test_run_feeds_project_context_to_model()
+    test_run_feeds_file_contents_to_large_budget_models_only()
     test_react_wiring()
     test_get_tree()
     test_context_issue_upsert()
     test_unified_from_files()
-    test_reconcile_scope()
+    test_reconcile_resolves_stale_instead_of_deleting()
+    test_reconcile_unresolves_on_recurrence_and_degrades_safe()
+    test_gh_review_thread_state_and_resolve()
     test_review_incremental()
     test_number_diff()
     test_partition_snaps_near_misses()
@@ -810,4 +1620,17 @@ if __name__ == "__main__":
     test_blockers()
     test_unresolved_count()
     test_merge_gating()
+    test_prior_issues_text_roots_in_scope_only()
+    test_prior_issues_text_skips_resolved_roots()
+    test_build_prompt_includes_prior_issues()
+    test_run_feeds_prior_issues_on_incremental()
+    test_classify_thread_reply()
+    test_review_comment_helpers()
+    test_get_review_comment_thread_resolves_root_from_any_comment()
+    test_reply_thread_prompt_pieces()
+    test_reply_thread_run_only_answers_bot_threads()
+    test_reply_thread_bills_its_own_bucket()
+    test_review_run_returns_done_or_failed()
+    test_review_skips_when_the_noise_strip_leaves_nothing()
+    test_review_does_not_burn_the_head_when_no_model_answers()
     print("ok")

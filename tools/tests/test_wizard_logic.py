@@ -66,8 +66,16 @@ def test_teardown_guide():
 
 
 def test_constants():
-    assert len(GITHUB_APP_PERMISSIONS) == 4
-    assert GITHUB_APP_WEBHOOK_EVENTS == ["Pull request", "Issue comment"]
+    assert len(GITHUB_APP_PERMISSIONS) == 5
+    # Checks write and the two review events are the ones that fail silently when
+    # missed — the bot just never posts a check or answers a thread reply.
+    assert ("Checks", "Read and write") in [(p, lvl) for p, lvl, _ in GITHUB_APP_PERMISSIONS]
+    assert GITHUB_APP_WEBHOOK_EVENTS == [
+        "Pull request",
+        "Issue comment",
+        "Pull request review comment",
+        "Pull request review thread",
+    ]
 
 
 if __name__ == "__main__":

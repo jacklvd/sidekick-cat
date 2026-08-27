@@ -30,7 +30,7 @@ def test_classify():
     assert classify("pull_request", {"action": "opened", "sender": {"type": "Bot"}})["kind"] == "ignore"
     assert classify("issue_comment", {"action": "created", "sender": {"login": "sidekick-cat[bot]"}})["kind"] == "ignore"
 
-    # PR open -> pr_open with extracted fields.
+    # PR open -> pr_open with extracted fields. review=True: a non-draft open earns one.
     i = classify("pull_request", {
         "action": "opened", "sender": {"login": "alice"},
         "repository": {"full_name": "alice/repo"},
@@ -38,41 +38,87 @@ def test_classify():
         "installation": {"id": 99},
     })
     assert i == {"kind": "pr_open", "owner": "alice", "repo": "repo",
-                 "number": 7, "head_sha": "abc", "author": "bob", "installation_id": 99}
+                 "number": 7, "head_sha": "abc", "author": "bob", "installation_id": 99,
+                 "review": True}
 
-    # PR changed after open -> pr_update (revalidate + relabel; no welcome/AI).
+    # A draft opens with review=False: WIP is the phase with the most pushes and the
+    # least finished code. /review still works inside one.
+    d = classify("pull_request", {
+        "action": "opened", "sender": {"login": "alice"},
+        "repository": {"full_name": "alice/repo"},
+        "pull_request": {"number": 7, "head": {"sha": "abc"}, "user": {"login": "bob"},
+                         "draft": True},
+        "installation": {"id": 99},
+    })
+    assert d["kind"] == "pr_open" and d["review"] is False
+
+    # PR changed after open -> pr_update (revalidate + relabel). An `edited` is a
+    # description/title change, not code -> review=False.
     u = classify("pull_request", {
         "action": "edited", "sender": {"login": "alice"},
         "repository": {"full_name": "alice/repo"},
         "pull_request": {"number": 7}, "installation": {"id": 99},
     })
     assert u == {"kind": "pr_update", "owner": "alice", "repo": "repo",
-                 "number": 7, "installation_id": 99}
-    assert classify("pull_request", {"action": "synchronize", "sender": {"login": "a"},
-                                     "pull_request": {"number": 1}})["kind"] == "pr_update"
+                 "number": 7, "installation_id": 99, "review": False}
+
+    # New commits on a non-draft -> review.
+    s = classify("pull_request", {"action": "synchronize", "sender": {"login": "a"},
+                                  "pull_request": {"number": 1}})
+    assert s["kind"] == "pr_update" and s["review"] is True
+
+    # ...but not while it's a draft.
+    sd = classify("pull_request", {"action": "synchronize", "sender": {"login": "a"},
+                                   "pull_request": {"number": 1, "draft": True}})
+    assert sd["kind"] == "pr_update" and sd["review"] is False
+
+    # Marking a draft ready is the moment it earns its first review. GitHub sends
+    # draft=False with this action (the transition already happened).
+    r = classify("pull_request", {"action": "ready_for_review", "sender": {"login": "a"},
+                                  "pull_request": {"number": 1, "draft": False}})
+    assert r["kind"] == "pr_update" and r["review"] is True
+
     # A truly unhandled PR action is still ignored.
     assert classify("pull_request", {"action": "labeled", "sender": {"login": "a"}})["kind"] == "ignore"
+
+    # A human resolving/unresolving a review thread -> recompute the check.
+    t = classify("pull_request_review_thread", {
+        "action": "resolved", "sender": {"login": "alice"},
+        "repository": {"full_name": "alice/repo"},
+        "pull_request": {"number": 7}, "installation": {"id": 99},
+    })
+    assert t == {"kind": "check", "owner": "alice", "repo": "repo",
+                 "number": 7, "installation_id": 99}
+    assert classify("pull_request_review_thread", {
+        "action": "unresolved", "sender": {"login": "a"},
+        "pull_request": {"number": 7}})["kind"] == "check"
+    # The bot resolving its own thread -> ignored by the loop guard.
+    assert classify("pull_request_review_thread", {
+        "action": "resolved", "sender": {"type": "Bot"},
+        "pull_request": {"number": 7}})["kind"] == "ignore"
+    # An unhandled thread action -> ignored.
+    assert classify("pull_request_review_thread", {
+        "action": "edited", "sender": {"login": "a"},
+        "pull_request": {"number": 7}})["kind"] == "ignore"
 
     base = {
         "action": "created", "sender": {"login": "alice"},
         "repository": {"full_name": "alice/repo"},
-        "issue": {"number": 7, "pull_request": {"url": "x"}},
+        "issue": {"number": 7, "pull_request": {"url": "..."}},
         "installation": {"id": 99},
     }
-    # Authorized /review comment on a PR -> command.
     i = classify("issue_comment", {**base, "comment": {"body": "please /review", "author_association": "OWNER", "id": 5}})
     assert i["kind"] == "command" and i["command"] == "review" and i["comment_id"] == 5
-    # /merge.
+    assert i["number"] == 7 and i["installation_id"] == 99
     i = classify("issue_comment", {**base, "comment": {"body": "/merge", "author_association": "MEMBER", "id": 6}})
-    assert i["command"] == "merge"
-    # /context.
+    assert i["kind"] == "command" and i["command"] == "merge"
     i = classify("issue_comment", {**base, "comment": {"body": "/context", "author_association": "OWNER", "id": 7}})
-    assert i["kind"] == "command" and i["command"] == "context" and i["comment_id"] == 7
-    # Unauthorized commenter ignored.
+    assert i["kind"] == "command" and i["command"] == "context"
+    # unauthorized commenter
     assert classify("issue_comment", {**base, "comment": {"body": "/review", "author_association": "NONE"}})["kind"] == "ignore"
-    # Comment not on a PR ignored.
+    # comment on an issue, not a PR
     assert classify("issue_comment", {**base, "issue": {"number": 7}, "comment": {"body": "/review", "author_association": "OWNER"}})["kind"] == "ignore"
-    # No command ignored.
+    # no command in the body
     assert classify("issue_comment", {**base, "comment": {"body": "hi", "author_association": "OWNER"}})["kind"] == "ignore"
 
 

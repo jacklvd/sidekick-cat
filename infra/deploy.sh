@@ -12,6 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 uv run python -m scripts.tests.test_pr_logic
+uv run python -m scripts.tests.test_check_run
 uv run python -m scripts.tests.test_limits
 uv run python -m scripts.tests.test_server
 

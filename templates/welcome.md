@@ -1,4 +1,4 @@
-👋 Hey @{author} — welcome, I'm Sidekick! Thank you so much for opening this pull request!
+👋 Hey @{author} — welcome, I'm Sidekick {icon}! Thank you so much for opening this pull request!
 
 We're really glad you're here. Every contribution, big or small, helps make this
 project better, and we appreciate the time and care you've put into this one. 💜
@@ -19,8 +19,11 @@ Here's what happens next:
 
 - 🏷️ I'll label this PR based on the files you touched
 - ✅ I'll check the description for the sections above and let you know if anything's missing
-- 🐱 Comment `/review` whenever you'd like my code review
-- 🚀 Comment `/merge` to merge once everything's green
+- 🔍 I'll post a full code review **automatically** — inline comments right on the changed lines
+- 💬 Reply inside any of my review threads to ask a follow-up — I'll answer right there
+- {icon} Comment `/review` to re-run the review by hand (or to get one on a draft)
+- 🔄 Comment `/context` to refresh my understanding of the repo
+- 🚀 Comment `/merge` once the checks are green and my review threads are resolved
 
 Sit back and relax — a maintainer will take a look soon. Thanks again for
-contributing, and happy coding! 🌙
+contributing, and happy coding! 🐱

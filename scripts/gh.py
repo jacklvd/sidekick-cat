@@ -11,6 +11,8 @@ import urllib.request
 
 from github import Auth, Github
 
+from scripts.config import DEFAULT_LABEL_COLOR, LABEL_COLORS
+
 _API = "https://api.github.com"
 log = logging.getLogger("sidekick-cat.gh")
 
@@ -29,6 +31,86 @@ def graphql(token, query, variables):
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read())
+
+
+_THREADS_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){"
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+    "reviewThreads(first:100){nodes{id isResolved "
+    "comments(first:1){nodes{databaseId}}}}}}}"
+)
+_RESOLVE_MUT = "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+_UNRESOLVE_MUT = "mutation($id:ID!){unresolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+
+
+def review_thread_state(repo, pr_number, token):
+    """{root comment databaseId -> (thread node id, is_resolved)} for every review
+    thread on the PR. databaseId joins to a REST comment's `.id`, so reconcile can find
+    a root's GraphQL thread — resolution is GraphQL-only, REST comments don't carry it.
+
+    Best-effort: returns {} if the read fails, so reconcile degrades to edit/create
+    without resolving (never deletes)."""
+    owner, name = repo.full_name.split("/", 1)
+    try:
+        data = graphql(token, _THREADS_QUERY, {"owner": owner, "name": name, "number": pr_number})
+        nodes = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    except Exception:
+        log.warning("review_thread_state read failed for PR #%s", pr_number, exc_info=True)
+        return {}
+    state = {}
+    for n in nodes:
+        roots = (n.get("comments") or {}).get("nodes") or []
+        if roots and roots[0].get("databaseId") is not None:
+            state[roots[0]["databaseId"]] = (n["id"], bool(n["isResolved"]))
+    return state
+
+
+def resolve_thread(token, thread_id):
+    """Mark a review thread resolved (GraphQL). Best-effort — logs and returns on
+    failure so one thread not resolving doesn't abort the reconcile.
+
+    dev-note: needs the App's `pull_requests: write` (it authors these threads). If it
+    ever 403s, the reconcile still adds the "no longer flags this" note; the thread just
+    stays open — no worse than the pre-resolve behavior, and no data lost."""
+    try:
+        graphql(token, _RESOLVE_MUT, {"id": thread_id})
+    except Exception:
+        log.warning("resolve_thread failed for %s", thread_id, exc_info=True)
+
+
+def unresolve_thread(token, thread_id):
+    """Mark a review thread unresolved (GraphQL) — a fixed issue that recurred, so the
+    merge gate must count it again. Best-effort, same rationale as resolve_thread."""
+    try:
+        graphql(token, _UNRESOLVE_MUT, {"id": thread_id})
+    except Exception:
+        log.warning("unresolve_thread failed for %s", thread_id, exc_info=True)
+
+
+def get_check_run(repo, head_sha, name):
+    """The check run named `name` on `head_sha`, or None. `get_check_runs` filters
+    server-side by name, so the first result is the one we own (only this App creates
+    a check by this name)."""
+    for run in repo.get_commit(head_sha).get_check_runs(check_name=name):
+        return run
+    return None
+
+
+def upsert_check_run(repo, head_sha, name, status, conclusion, title, summary):
+    """Write the check idempotently: edit the run of this name on the head if it
+    exists, else create it. `create_check_run` is NOT idempotent — the same name on
+    the same head yields a duplicate row — so two racing dispatches would otherwise
+    show two Sidekick checks. Name is the natural key, same principle as upsert_comment.
+
+    `conclusion` is None for an in_progress check; omit it rather than send null."""
+    kwargs = {"status": status, "output": {"title": title, "summary": summary}}
+    if conclusion is not None:
+        kwargs["conclusion"] = conclusion
+    existing = get_check_run(repo, head_sha, name)
+    if existing is not None:
+        existing.edit(**kwargs)
+    else:
+        repo.create_check_run(name=name, head_sha=head_sha, **kwargs)
 
 
 def get_pr_diff(full_name, number, token):
@@ -83,12 +165,18 @@ def get_repo():
     return Github(os.environ["GH_TOKEN"]).get_repo(os.environ["GITHUB_REPOSITORY"])
 
 
-def get_file_text(repo, path):
-    """Default-branch contents of `path` as text, or None if absent. Best-effort —
-    used to feed the target repo's CLAUDE.md to the reviewer (no local checkout on
-    Cloud Run)."""
+def get_file_text(repo, path, ref=None):
+    """Contents of `path` as text, or None if absent. Best-effort — used to feed the
+    target repo's CLAUDE.md to the reviewer (no local checkout on Cloud Run).
+
+    `ref` defaults to the default branch. Pass the PR head sha when reading a file the
+    PR itself touches: a helper the PR adds doesn't exist on the default branch yet, so
+    reading without a ref would report it missing — which is the exact mistake we're
+    giving the reviewer this data to stop making."""
     try:
-        return repo.get_contents(path).decoded_content.decode("utf-8", errors="replace")
+        kwargs = {"ref": ref} if ref else {}
+        contents = repo.get_contents(path, **kwargs)
+        return contents.decoded_content.decode("utf-8", errors="replace")
     except Exception:
         return None  # dev-note: missing file / dir / binary → just review without it
 
@@ -134,10 +222,48 @@ def submit_review(repo, pr_number, body, event):
     repo.get_pull(pr_number).create_review(body=body, event=event)
 
 
+def get_review_comments(repo, pr_number):
+    """Every review (inline) comment on the PR — thread roots and replies alike.
+    One API round-trip; callers that need only roots filter on in_reply_to_id."""
+    return list(repo.get_pull(pr_number).get_review_comments())
+
+
 def get_inline_comments(repo, pr_number, marker):
-    """The bot's existing inline review comments (those carrying the marker)."""
+    """The bot's inline thread ROOTS carrying `marker`. Roots only (in_reply_to_id
+    is None): a reply — the bot's own answer, or a human's — must never be keyed as
+    an existing comment, or reconcile_inline would collide it with its own thread."""
     tag = f"<!-- {marker} -->"
-    return [c for c in repo.get_pull(pr_number).get_review_comments() if tag in (c.body or "")]
+    return [
+        c for c in get_review_comments(repo, pr_number)
+        if tag in (c.body or "") and c.in_reply_to_id is None
+    ]
+
+
+def get_review_comment_thread(repo, pr_number, comment_id):
+    """(root, [root, ...replies]) for the thread CONTAINING `comment_id`, in id order
+    (≈ chronological). (None, []) if the comment is gone. Feeds reply_thread with the
+    conversation so far.
+
+    `comment_id` may be any comment in the thread, not just the root: we walk
+    `in_reply_to_id` up to the root (the comment with none). A webhook delivers the id
+    of the comment a reply answers, and while GitHub review threads are flat today (so
+    that id is already the root), resolving explicitly means the flow can't silently
+    no-op if that ever stops holding — a webhook path is miserable to debug live."""
+    comments = get_review_comments(repo, pr_number)
+    by_id = {c.id: c for c in comments}
+    node = by_id.get(comment_id)
+    while node is not None and node.in_reply_to_id is not None:
+        node = by_id.get(node.in_reply_to_id)
+    if node is None:
+        return None, []
+    thread = [node] + [c for c in comments if c.in_reply_to_id == node.id]
+    thread.sort(key=lambda c: c.id)
+    return node, thread
+
+
+def create_review_comment_reply(repo, pr_number, root_id, body):
+    """Post `body` as a reply in the thread rooted at `root_id`."""
+    repo.get_pull(pr_number).create_review_comment_reply(root_id, body)
 
 
 def create_review_comment(repo, pr_number, head_sha, path, line, body):
@@ -157,11 +283,18 @@ def set_managed_labels(repo, pr_number, desired, managed):
     current = {lbl.name for lbl in issue.get_labels()}
     add = [n for n in desired if n not in current]
     remove = [n for n in managed if n in current and n not in desired]
-    for name in add:  # create any label that doesn't exist yet, so setup is zero-config
+    for name in desired:  # create any label that doesn't exist yet, so setup is zero-config
+        color = LABEL_COLORS.get(name, DEFAULT_LABEL_COLOR)
         try:
-            repo.get_label(name)
+            label = repo.get_label(name)
         except Exception:
-            repo.create_label(name=name, color="ededed")
+            repo.create_label(name=name, color=color)
+            continue
+        # Repaint only labels still wearing the old default grey: that means the bot made
+        # them and nobody has recolored them since, so every repo self-heals on its next
+        # PR. A color a human picked is left alone.
+        if label.color == DEFAULT_LABEL_COLOR != color:
+            label.edit(name=name, color=color)
     if add:
         issue.add_to_labels(*add)
     for name in remove:
@@ -178,6 +311,28 @@ def get_tree(repo) -> list[tuple[str, int]]:
         return [(e.path, e.size or 0) for e in tree.tree if e.type == "blob"]
     except Exception:
         return []
+
+
+def merged_since(repo, since, limit):
+    """How many PRs merged after `since`, counted up to `limit` (callers only ever
+    ask "is it N or more?"). Stateless: no counter to keep in sync — GitHub already
+    records merge times, and repo_context's cache issue already records its own.
+    Scans closed PRs newest-*updated* first and stops at the first one untouched
+    since `since` — anything merged after `since` was also updated after it, so the
+    scanned window is a superset. Best-effort: an API hiccup yields 0 (age-based
+    staleness still applies) rather than breaking a review."""
+    n = 0
+    try:
+        for pr in repo.get_pulls(state="closed", sort="updated", direction="desc"):
+            if pr.updated_at < since:
+                break
+            if pr.merged_at is not None and pr.merged_at > since:
+                n += 1
+                if n >= limit:
+                    break
+    except Exception:
+        return n
+    return n
 
 
 def get_context_issue(repo, marker):

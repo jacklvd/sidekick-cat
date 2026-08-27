@@ -255,9 +255,22 @@ def record_failure() -> None:
 
 
 def record_success() -> None:
-    """Clear the recent-failure streak after a good call."""
+    """Clear the recent-failure streak *and* any open cooldown after a good call.
+
+    Clearing the cooldown matters because llm_client.complete() records a failure per
+    fallback *rung*, not per call, and the review tiers now run six NVIDIA rungs. One
+    review where NVIDIA is having a bad day burns 6 failures — over BREAKER_FAILS — and
+    opens the breaker mid-call, even when a lower rung then answers fine. Without this
+    the successful review would be followed by 15 minutes of "AI quota reached" on a
+    system that is demonstrably working.
+
+    A call that reached an answer is the strongest possible evidence the providers are up,
+    so it ends the cooldown. The breaker still fires on a real outage: nothing succeeds,
+    so nothing clears it, and the failures accumulate as before."""
+    global _open_until
     with _lock:
         _fails.clear()
+        _open_until = 0.0
 
 
 def _reset() -> None:

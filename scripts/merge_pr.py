@@ -10,7 +10,7 @@ token (Cloud Run) or GH_TOKEN (Actions) — both valid for api.github.com.
 import os
 
 from scripts import gh
-from scripts.config import REQUIRED_SECTIONS
+from scripts.config import ICON, ICON_HMM, REQUIRED_SECTIONS
 from scripts.validate_pr import missing_sections
 
 # Only these merge states are safe to merge. Everything else is a blocker.
@@ -20,7 +20,7 @@ _GOOD_STATES = {"CLEAN", "HAS_HOOKS"}
 # server-computed enum folding in conflicts, branch protection, required reviews,
 # checks, draft) plus reviewThreads. mergeStateStatus avoids statusCheckRollup,
 # which traverses Actions-scoped resources our Pull-requests-only token can't read.
-_PR_QUERY = (
+PR_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){"
     "repository(owner:$owner,name:$name){pullRequest(number:$number){"
     "state reviewDecision mergeStateStatus body "
@@ -87,14 +87,14 @@ def run(repo, pr_number, token):
     through the PyGithub `repo` handle. No `gh` CLI.
     """
     owner, name = repo.full_name.split("/", 1)
-    data = gh.graphql(token, _PR_QUERY, {"owner": owner, "name": name, "number": pr_number})
+    data = gh.graphql(token, PR_QUERY, {"owner": owner, "name": name, "number": pr_number})
     pr = (data.get("data") or {}).get("repository", {}).get("pullRequest", {}) or {}
 
     reasons = blockers(pr)
     if pr.get("state") == "OPEN":
         reasons += _unresolved_reasons(data)
     if reasons:
-        body = "### 🐱 Sidekick can't merge yet\n\n" + "\n".join(f"- {r}" for r in reasons)
+        body = f"### {ICON_HMM} Sidekick can't merge yet\n\n" + "\n".join(f"- {r}" for r in reasons)
         gh.upsert_comment(repo, pr_number, "bot:merge", body)
         return
 
@@ -106,7 +106,7 @@ def run(repo, pr_number, token):
         pass  # dev-note: fork PR / protected branch — merge succeeded, delete is best-effort
     gh.upsert_comment(
         repo, pr_number, "bot:merge",
-        "### 🐱 Shipped 🚀\nSquashed and deleted the branch.",
+        f"### {ICON} Shipped 🚀\nSquashed and deleted the branch.",
     )
 
 

@@ -8,8 +8,9 @@ source files (docstrings + imports show what calls what). One LLM call (task
 "context", NVIDIA GLM-first — the brief is folded into every
 review prompt, so it gets the strong tier; large-context models also see a much
 bigger tree, see config.MODEL_INPUT_CHARS). Refreshed manually via /context or
-lazily by /review when missing or older than CONTEXT_REFRESH_DAYS — staleness
-reads the issue's own `updated_at`, no separate bookkeeping needed.
+lazily by /review when missing, older than CONTEXT_REFRESH_DAYS, or with
+CONTEXT_REFRESH_PRS PRs merged since — staleness reads the issue's own
+`updated_at` and GitHub's merge times, no separate bookkeeping needed.
 """
 
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from scripts.config import (
     CONTEXT_KEY_FILES,
     CONTEXT_MAX_TREE_CHARS,
     CONTEXT_REFRESH_DAYS,
+    CONTEXT_REFRESH_PRS,
     MODEL_INPUT_CHARS,
     NOISE_GLOBS,
 )
@@ -33,6 +35,18 @@ _TITLE = "🐱 Sidekick project context (auto-generated, do not edit)"
 
 # dev-note: kept under ~500 words because review_pr.build_prompt slices the brief
 # at CONTEXT_MAX_TREE_CHARS — a longer brief would be cut mid-sentence downstream.
+#
+# The grounding rules below matter more here than in a one-shot repo explainer, and are
+# adapted from one (BaoNguyen09/repo-explainer). This brief is cached until the next
+# refresh and folded into *every* review in that window, so one invented
+# "purpose" or made-up convention doesn't mislead a reader once — it makes the reviewer
+# post confident, wrong blockers on every PR until it expires. An honest "unclear" costs a
+# reviewer nothing; a confident hallucination costs it its credibility.
+# dev-note: deliberately NOT copying that project's output format (mermaid diagram,
+# re-printed file tree, ~1500 words). It targets a human reading a page; this brief is
+# machine-fed into a review prompt that already carries the diff, so a diagram and a
+# second copy of the tree would just spend the 6K-char slice on things the reviewer
+# can't use — and 1500 words would be cut mid-sentence by that same slice.
 _SYSTEM = (
     "You are a senior engineer writing an onboarding brief for a code reviewer "
     "who has never seen this repository. Given its file tree and a few key "
@@ -41,9 +55,27 @@ _SYSTEM = (
     "**Layout** — top-level folders/modules, one line of purpose each, plus "
     "notable relationships (what calls what, what owns what state).\n"
     "**Conventions** — coding/testing/dependency rules a reviewer should "
-    "enforce, inferred from the docs and manifests; skip generic advice.\n"
+    "enforce, inferred from the docs and manifests; skip generic advice. Name the "
+    "runtime dependencies the manifests actually declare — a reviewer who doesn't "
+    "know them will suggest adding one that's already there, or one the project has "
+    "chosen to live without.\n"
     "**Review watch-fors** — the riskiest spots: trust boundaries, invariants, "
     "easy-to-break couplings between the parts above.\n"
+    "\n"
+    "Grounding rules — a reviewer will act on this brief, so a confident guess is "
+    "worse than an omission:\n"
+    "- The tree and files given to you are the only source of truth. Do not state the "
+    "project's purpose, audience, or history unless a README, manifest, or docstring "
+    "says it; otherwise describe only what the files show.\n"
+    "- Never describe what projects 'of this kind' typically or usually do. This "
+    "repository is the subject, not its genre.\n"
+    "- Mark anything you infer from names or structure as an inference ('appears to', "
+    "'suggests'). State only what you read as fact.\n"
+    "- If a section has nothing grounded to say, write one line saying so and move on. "
+    "Do not pad.\n"
+    "- Name every file and folder by its full repo-relative path (`server/app.py`, "
+    "never `app.py`) — the reviewer matches these against paths in a diff.\n"
+    "\n"
     "Under 500 words total. No preamble, no restating the file list verbatim — "
     "synthesize."
 )
@@ -97,9 +129,14 @@ def build_context_prompt(tree_text: str, key_files: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
-def is_stale(issue) -> bool:
-    """True if there's no issue yet, or it hasn't been refreshed in CONTEXT_REFRESH_DAYS."""
+def is_stale(issue, merged_prs: int = 0) -> bool:
+    """True if there's no issue yet, it hasn't been refreshed in CONTEXT_REFRESH_DAYS,
+    or CONTEXT_REFRESH_PRS PRs have merged since it was (`merged_prs`) — whichever
+    trips first. Age alone lets a shipped refactor leave the brief wrong for the rest
+    of the window; the PR count catches exactly that, and stays quiet on idle repos."""
     if issue is None:
+        return True
+    if merged_prs >= CONTEXT_REFRESH_PRS:
         return True
     age = datetime.now(timezone.utc) - issue.updated_at
     return age.days >= CONTEXT_REFRESH_DAYS
@@ -114,7 +151,7 @@ def run(repo) -> "str | None":
     """Generate + cache the project-context doc. Returns the body, or None if
     rate-limited or the model didn't return usable content. Host-agnostic core.
     Gated on a repo-scoped pseudo-PR key ("context"), not the triggering PR's own
-    bucket — this is a once-a-month repo-level refresh, not part of any single
+    bucket — this is an occasional repo-level refresh, not part of any single
     PR's review budget, so it shouldn't silently halve that PR's daily cap."""
     ok, _ = limits.allow_llm_call(repo.full_name, "context")
     if not ok:
@@ -149,8 +186,10 @@ def ensure_fresh(repo) -> str:
     """Context text for /review to include: reuse if fresh, else refresh (falling
     back to a stale-but-present doc, then "" if generation fails). Never raises."""
     issue = gh.get_context_issue(repo, _MARKER)
-    if issue is not None and not is_stale(issue):
-        return _strip_marker(issue.body or "")
+    if issue is not None:
+        merged = gh.merged_since(repo, issue.updated_at, CONTEXT_REFRESH_PRS)
+        if not is_stale(issue, merged):
+            return _strip_marker(issue.body or "")
     fresh = run(repo)
     if fresh is not None:
         return fresh
